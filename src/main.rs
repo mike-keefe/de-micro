@@ -3071,16 +3071,25 @@ impl Game {
             draw_text(&bots_label, cx - mb.width / 2.0, sh * 0.4 + 106.0, 22.0, Color::from_rgba(210, 210, 210, 255));
         }
 
+        let online_line = if matches!(self.role, Role::Solo) {
+            "[H] host online game    [V] join game (paste ticket into clipboard first)"
+        } else {
+            "F10 debug menu in-game"
+        };
         let lines = [
             "WASD move    Mouse aim / shoot    Space jump    Shift walk",
             "1 AK-47    2 pistol    R reload    E plant / defuse    Esc pause",
-            "F10 debug    --host to host online    --join <ticket> to join",
+            online_line,
         ];
         let mut y = sh * 0.62;
         for l in lines {
             let m = measure_text(l, None, 20, 1.0);
             draw_text(l, cx - m.width / 2.0, y, 20.0, Color::from_rgba(210, 210, 210, 255));
             y += 30.0;
+        }
+        if self.sub_t > 0.0 && !self.sub.is_empty() {
+            let m = measure_text(&self.sub, None, 20, 1.0);
+            draw_text(&self.sub, cx - m.width / 2.0, sh * 0.72, 20.0, Color::from_rgba(255, 150, 130, 255));
         }
         let go = if matches!(self.role, Role::Client(_)) && !self.cstate.welcomed {
             "CLICK TO CONNECT"
@@ -3320,6 +3329,25 @@ async fn main() {
                     g.bot_fill = (g.bot_fill - 1).max(0);
                 }
             }
+            if matches!(g.role, Role::Solo) {
+                if is_key_pressed(KeyCode::H) {
+                    g.role = Role::Host(net::start_host());
+                }
+                if is_key_pressed(KeyCode::V) {
+                    match macroquad::miniquad::window::clipboard_get() {
+                        Some(t) if net::addr_from_ticket(&t).is_some() => {
+                            g.role = Role::Client(net::start_client(
+                                t,
+                                g.my_name.clone(),
+                                g.player_team.is_t(),
+                            ));
+                        }
+                        _ => {
+                            g.show_sub("clipboard does not contain a valid ticket", 3.0);
+                        }
+                    }
+                }
+            }
         }
 
         if is_mouse_button_pressed(MouseButton::Left) && !g.grabbed {
@@ -3348,6 +3376,11 @@ async fn main() {
         }
 
         g.debug_input();
+
+        if g.phase == Phase::Menu {
+            g.sub_t -= dt;
+            g.msg_t -= dt;
+        }
 
         let paused = !g.grabbed && g.phase != Phase::Menu && matches!(g.role, Role::Solo);
 
