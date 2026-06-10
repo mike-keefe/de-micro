@@ -1,6 +1,6 @@
 # de_micro
 
-Minimal native Counter-Strike clone in Rust (macroquad). One map, defuse mode, bots.
+Minimal native Counter-Strike clone in Rust (macroquad). One map, defuse mode, bots, online multiplayer with zero setup.
 
 ## Run
 
@@ -8,14 +8,33 @@ Minimal native Counter-Strike clone in Rust (macroquad). One map, defuse mode, b
 cargo run --release
 ```
 
-or after building: `./target/release/de-micro`
+## Multiplayer (p2p over the internet, no accounts, no port forwarding)
+
+Connectivity uses [iroh](https://iroh.computer) - NAT hole-punching via their free public relays. Nobody signs up for anything.
+
+**Host** (your machine runs the game world):
+
+```sh
+./target/release/de-micro --host
+```
+
+A join ticket is printed to the terminal and copied to your clipboard. Send it to friends.
+
+**Join**:
+
+```sh
+./target/release/de-micro --join <ticket>            # join as CT
+./target/release/de-micro --join <ticket> --team-t   # join as T
+./target/release/de-micro --join <ticket> --name Bob # custom name
+```
+
+Friends and bots share teams; bots top up each team to the configured fill. Host arbitrates everything (hits, bomb, rounds); clients are trusted, so play with friends, not strangers.
 
 ## How to play
 
-- Pick your team on the menu: press 1 (CT) or 2 (T), then click.
-- 4v4 with bots filling both teams. Ts plant the C4 at site A or B; CTs stop them or defuse.
-- As T with the bomb: hold E inside a site to plant. As CT: hold E near the bomb to defuse (5s).
-- First team to 8 rounds wins the match. When dead, spectate teammates (LMB / Space cycles).
+- Menu: 1/2 picks team, F toggles friendly fire, Up/Down sets bot fill (0-4 per team), click to start.
+- Ts plant the C4 at site A or B (hold E in a site); CTs kill them or defuse (hold E at the bomb).
+- First team to 8 rounds. Dead? LMB/Space cycles spectate.
 
 ## Controls
 
@@ -32,12 +51,4 @@ or after building: `./target/release/de-micro`
 
 ## Debug menu (F10)
 
-| Key | Toggle |
-|-----|--------|
-| F1 | god mode |
-| F2 | noclip fly (Space up, Ctrl down) |
-| F3 | wallhack ESP (boxes + hp through walls) |
-| F4 | show bot paths + vision lines |
-| F5 | freeze bot AI |
-| F6 | kill all enemies |
-| F7 | full heal + ammo |
+F1 god, F2 noclip, F3 wallhack ESP, F4 bot paths/vision, F5 freeze AI, F6 kill enemies, F7 heal+ammo.

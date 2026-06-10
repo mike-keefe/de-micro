@@ -1,8 +1,11 @@
+mod net;
+
 use macroquad::audio::{load_sound_from_bytes, play_sound, PlaySoundParams, Sound};
 use macroquad::camera::Camera;
 use macroquad::models::{draw_mesh, Mesh, Vertex};
 use macroquad::prelude::*;
 use macroquad::rand::gen_range;
+use net::{BotNet, ClientEvent, Event, HitClaim, HostEvent, PlayerInput, PlayerNet, ShotMsg, Snapshot, C2S, S2C};
 
 const GRAVITY: f32 = 20.0;
 const PLAYER_SPEED: f32 = 6.3;
@@ -19,13 +22,30 @@ const DEFUSE_TIME: f32 = 5.0;
 const BOT_DEFUSE_TIME: f32 = 8.0;
 const FREEZE_TIME: f32 = 2.5;
 const WIN_SCORE: i32 = 8;
+const NET_RATE: f32 = 1.0 / 30.0;
 
-const NAMES: [&str; 7] = ["Phoenix", "Viper", "Sandman", "Crusher", "Steel", "Hawk", "Reaper"];
+const BOT_NAMES: [&str; 10] = [
+    "Phoenix", "Viper", "Sandman", "Crusher", "Steel", "Hawk", "Reaper", "Falcon", "Brute", "Ghost",
+];
+const SPAWN_X: [f32; 6] = [-10.0, -6.0, -2.0, 2.0, 6.0, 10.0];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Team {
     Ct,
     T,
+}
+
+impl Team {
+    fn is_t(self) -> bool {
+        self == Team::T
+    }
+    fn from_t(t: bool) -> Team {
+        if t {
+            Team::T
+        } else {
+            Team::Ct
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -34,6 +54,13 @@ enum Phase {
     Freeze,
     Live,
     Post,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Ent {
+    Me,
+    Remote(u8),
+    Bot(usize),
 }
 
 // ---------- math / collision ----------
@@ -138,6 +165,14 @@ fn angle_lerp(a: f32, b: f32, t: f32) -> f32 {
         d += std::f32::consts::TAU;
     }
     a + d * t
+}
+
+fn v3(a: [f32; 3]) -> Vec3 {
+    vec3(a[0], a[1], a[2])
+}
+
+fn a3(v: Vec3) -> [f32; 3] {
+    [v.x, v.y, v.z]
 }
 
 // ---------- audio synth ----------
@@ -341,7 +376,6 @@ fn push_box(verts: &mut Vec<Vertex>, inds: &mut Vec<u16>, b: &Aabb, c: Color) {
         ],
         shade(c, 0.68),
     );
-    // bottom face skipped for static map (never visible), kept for oriented boxes elsewhere
 }
 
 fn aabb(cx: f32, cz: f32, w: f32, d: f32, h: f32, y0: f32) -> Aabb {
@@ -369,36 +403,30 @@ fn build_map() -> (Vec<Aabb>, Vec<Mesh>) {
         list.push((b, c));
     };
 
-    // perimeter
     add(&mut colored, &mut walls, aabb(0.0, -30.5, 82.0, 1.0, 5.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(0.0, 30.5, 82.0, 1.0, 5.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(-40.5, 0.0, 1.0, 62.0, 5.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(40.5, 0.0, 1.0, 62.0, 5.0, 0.0), wall_col);
 
-    // big building blocks forming B tunnel (west) and Long A (east)
     add(&mut colored, &mut walls, aabb(-36.0, -14.0, 8.0, 18.0, 4.5, 0.0), block_col);
     add(&mut colored, &mut walls, aabb(-16.0, -14.0, 7.0, 14.0, 4.5, 0.0), block_col);
     add(&mut colored, &mut walls, aabb(36.0, -14.0, 8.0, 18.0, 4.5, 0.0), block_col);
     add(&mut colored, &mut walls, aabb(16.0, -14.0, 7.0, 14.0, 4.5, 0.0), block_col);
 
-    // tunnel / long archway lintels
     add(&mut colored, &mut walls, aabb(-25.75, -21.0, 12.5, 1.0, 2.1, 2.4), lintel_col);
     add(&mut colored, &mut walls, aabb(-25.75, -7.0, 12.5, 1.0, 2.1, 2.4), lintel_col);
     add(&mut colored, &mut walls, aabb(25.75, -21.0, 12.5, 1.0, 2.1, 2.4), lintel_col);
     add(&mut colored, &mut walls, aabb(25.75, -7.0, 12.5, 1.0, 2.1, 2.4), lintel_col);
 
-    // mid lane dividers with connector gaps to sites
     add(&mut colored, &mut walls, aabb(-12.0, -10.5, 1.0, 15.0, 4.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(-12.0, 10.5, 1.0, 15.0, 4.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(12.0, -10.5, 1.0, 15.0, 4.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(12.0, 10.5, 1.0, 15.0, 4.0, 0.0), wall_col);
 
-    // mid doors
     add(&mut colored, &mut walls, aabb(-7.25, 0.0, 8.5, 1.0, 4.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(7.25, 0.0, 8.5, 1.0, 4.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(0.0, 0.0, 6.0, 1.0, 2.0, 2.5), lintel_col);
 
-    // site south walls with CT doors
     add(&mut colored, &mut walls, aabb(-33.0, 14.0, 15.0, 1.0, 4.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(-17.75, 14.0, 10.5, 1.0, 4.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(-24.25, 14.0, 2.5, 1.0, 1.6, 2.4), lintel_col);
@@ -406,13 +434,11 @@ fn build_map() -> (Vec<Aabb>, Vec<Mesh>) {
     add(&mut colored, &mut walls, aabb(17.75, 14.0, 10.5, 1.0, 4.0, 0.0), wall_col);
     add(&mut colored, &mut walls, aabb(24.25, 14.0, 2.5, 1.0, 1.6, 2.4), lintel_col);
 
-    // sandbag half-walls (jumpable, block bots)
     add(&mut colored, &mut walls, aabb(-29.0, 3.0, 4.0, 1.0, 1.0, 0.0), bag_col);
     add(&mut colored, &mut walls, aabb(-21.5, -2.0, 1.0, 4.0, 1.0, 0.0), bag_col);
     add(&mut colored, &mut walls, aabb(28.0, -3.0, 4.0, 1.0, 1.0, 0.0), bag_col);
     add(&mut colored, &mut walls, aabb(21.5, 2.0, 1.0, 4.0, 1.0, 0.0), bag_col);
 
-    // crates
     let crates = [
         (-27.0, -2.0),
         (-31.0, 6.0),
@@ -437,7 +463,6 @@ fn build_map() -> (Vec<Aabb>, Vec<Mesh>) {
     for (x, z) in crates {
         add(&mut colored, &mut walls, aabb(x, z, 2.0, 2.0, 2.0, 0.0), crate_col);
     }
-    // stacks (xbox in mid, site doubles)
     add(&mut colored, &mut walls, aabb(0.0, -4.0, 2.0, 2.0, 2.0, 2.0), shade(crate_col, 0.92));
     add(&mut colored, &mut walls, aabb(-27.0, -2.0, 2.0, 2.0, 2.0, 2.0), shade(crate_col, 0.92));
     add(&mut colored, &mut walls, aabb(27.0, 2.0, 2.0, 2.0, 2.0, 2.0), shade(crate_col, 0.92));
@@ -453,7 +478,6 @@ fn build_map() -> (Vec<Aabb>, Vec<Mesh>) {
         texture: None,
     };
 
-    // ground + zone floors
     let mut gv = Vec::new();
     let mut gi = Vec::new();
     push_quad(
@@ -467,7 +491,6 @@ fn build_map() -> (Vec<Aabb>, Vec<Mesh>) {
         ],
         Color::from_rgba(167, 149, 111, 255),
     );
-    // tunnel + long floors (stone)
     for sx in [-1.0f32, 1.0] {
         push_quad(
             &mut gv,
@@ -665,15 +688,14 @@ struct Bot {
     hp: i32,
     alive: bool,
     name: &'static str,
-    spawn: Vec3,
-    anchor: Vec2,
     goal: Vec2,
+    anchor: Vec2,
     path: Vec<Vec2>,
     path_i: usize,
     repath: f32,
     roam_t: f32,
     think: f32,
-    target: Option<usize>,
+    target: Option<Ent>,
     can_see: bool,
     lost_t: f32,
     react: f32,
@@ -698,9 +720,8 @@ impl Bot {
             hp: 100,
             alive: true,
             name,
-            spawn,
-            anchor: vec2(spawn.x, spawn.z),
             goal: vec2(spawn.x, spawn.z),
+            anchor: vec2(spawn.x, spawn.z),
             path: vec![],
             path_i: 0,
             repath: 0.0,
@@ -725,31 +746,47 @@ impl Bot {
     fn eye(&self) -> Vec3 {
         self.pos + vec3(0.0, 1.5, 0.0)
     }
+}
 
-    fn reset(&mut self) {
-        self.pos = self.spawn;
-        self.vy = 0.0;
-        self.hp = 100;
-        self.alive = true;
-        self.yaw = if self.team == Team::T { std::f32::consts::PI } else { 0.0 };
-        self.path.clear();
-        self.path_i = 0;
-        self.repath = 0.0;
-        self.target = None;
-        self.can_see = false;
-        self.react = 0.0;
-        self.alert_t = 0.0;
-        self.planting = 0.0;
-        self.defusing = 0.0;
-        self.roam_t = 0.0;
+struct RPlayer {
+    id: u8,
+    name: String,
+    team: Team,
+    pos: Vec3,
+    yaw: f32,
+    hp: i32,
+    alive: bool,
+    e_held: bool,
+    weapon: u8,
+    plant_p: f32,
+    defuse_p: f32,
+    spawn_seq: u32,
+    render_pos: Vec3,
+    render_yaw: f32,
+    step_acc: f32,
+}
+
+impl RPlayer {
+    fn eye(&self) -> Vec3 {
+        self.pos + vec3(0.0, EYE, 0.0)
     }
 }
 
 #[derive(Clone, Copy)]
-struct Snap {
+struct SimSnap {
+    ent: Ent,
     eye: Vec3,
     alive: bool,
     team: Team,
+}
+
+struct DrawEnt {
+    pos: Vec3,
+    yaw: f32,
+    team: Team,
+    carrier: bool,
+    name: String,
+    hp: i32,
 }
 
 struct WpnDef {
@@ -800,11 +837,41 @@ struct Bomb {
     beep_t: f32,
 }
 
+enum Role {
+    Solo,
+    Host(net::HostNet),
+    Client(net::ClientNet),
+}
+
+// client-side view of the world from snapshots
+struct CState {
+    my_id: u8,
+    welcomed: bool,
+    snap: Option<Snapshot>,
+    step_acc: std::collections::HashMap<u8, (Vec3, f32)>,
+    spawn_seq: u32,
+    beep_t: f32,
+    prev_hp: i32,
+    prev_alive: bool,
+    disconnect: Option<String>,
+}
+
 struct Game {
     walls: Vec<Aabb>,
     meshes: Vec<Mesh>,
     nav: Nav,
     snd: Sounds,
+
+    role: Role,
+    my_name: String,
+    ff: bool,
+    bot_fill: i32,
+    ticket: Option<String>,
+    cstate: CState,
+    remotes: Vec<RPlayer>,
+    ev_buf: Vec<Event>,
+    snap_timer: f32,
+    input_timer: f32,
 
     player_team: Team,
     ppos: Vec3,
@@ -823,13 +890,13 @@ struct Game {
     defuse_t: f32,
     plant_t: f32,
     step_t: f32,
-    spec: Option<usize>,
+    spec_i: usize,
 
     bots: Vec<Bot>,
 
     bomb: Option<Bomb>,
     defused: bool,
-    carrier: Option<usize>, // entity index: 0 = player, i+1 = bots[i]
+    carrier: Option<Ent>,
     dropped: Option<Vec3>,
     site: Vec2,
 
@@ -865,24 +932,19 @@ struct Game {
 }
 
 struct DmgEvent {
-    target: usize,
+    target: Ent,
     dmg: i32,
     killer: String,
     killer_team: Team,
-    shooter_pos: Vec3,
 }
 
 impl Game {
-    fn player_eye(&self) -> Vec3 {
-        self.ppos + vec3(0.0, EYE, 0.0)
+    fn is_authority(&self) -> bool {
+        !matches!(self.role, Role::Client(_))
     }
 
-    fn ent_eye(&self, idx: usize) -> Vec3 {
-        if idx == 0 {
-            self.player_eye()
-        } else {
-            self.bots[idx - 1].eye()
-        }
+    fn player_eye(&self) -> Vec3 {
+        self.ppos + vec3(0.0, EYE, 0.0)
     }
 
     fn look_dir(&self) -> Vec3 {
@@ -921,21 +983,43 @@ impl Game {
         if self.killfeed.len() > 6 {
             self.killfeed.remove(0);
         }
+        if self.is_authority() {
+            self.ev_buf.push(Event::Kill {
+                killer: killer.to_string(),
+                killer_ct: killer_team == Team::Ct,
+                victim: victim.to_string(),
+            });
+        }
     }
 
-    fn setup_teams(&mut self) {
-        let (n_t, n_ct) = if self.player_team == Team::T { (3, 4) } else { (4, 3) };
+    // ---------- round setup (authority) ----------
+
+    fn humans_on(&self, team: Team) -> usize {
+        let mut n = if self.player_team == team { 1 } else { 0 };
+        n += self.remotes.iter().filter(|r| r.team == team).count();
+        n
+    }
+
+    fn rebuild_bots(&mut self) {
         self.bots.clear();
         let mut name_i = 0;
-        let offsets = [-9.0, -4.5, 4.5, 9.0];
-        for k in 0..n_t {
-            self.bots.push(Bot::new(NAMES[name_i], Team::T, vec3(offsets[k], 0.0, -26.0)));
-            name_i += 1;
+        for team in [Team::T, Team::Ct] {
+            let humans = self.humans_on(team);
+            let target = (self.bot_fill as usize).max(humans).max(1);
+            let n_bots = target.saturating_sub(humans).min(SPAWN_X.len() - humans);
+            let z = if team == Team::T { -26.0 } else { 26.0 };
+            for k in 0..n_bots {
+                let x = SPAWN_X[(humans + k).min(SPAWN_X.len() - 1)];
+                self.bots.push(Bot::new(BOT_NAMES[name_i % BOT_NAMES.len()], team, vec3(x, 0.0, z)));
+                name_i += 1;
+            }
         }
-        for k in 0..n_ct {
-            self.bots.push(Bot::new(NAMES[name_i], Team::Ct, vec3(offsets[k], 0.0, 26.0)));
-            name_i += 1;
-        }
+    }
+
+    fn team_spawn(&self, team: Team, slot: usize) -> (Vec3, f32) {
+        let z = if team == Team::T { -26.0 } else { 26.0 };
+        let yaw = if team == Team::T { std::f32::consts::PI } else { 0.0 };
+        (vec3(SPAWN_X[slot.min(SPAWN_X.len() - 1)], 0.0, z), yaw)
     }
 
     fn start_round(&mut self) {
@@ -946,17 +1030,15 @@ impl Game {
             self.match_over = false;
         }
         self.round += 1;
-        self.ppos = if self.player_team == Team::T {
-            vec3(0.0, 0.0, -26.0)
-        } else {
-            vec3(0.0, 0.0, 26.0)
-        };
-        self.yaw = if self.player_team == Team::T { std::f32::consts::PI } else { 0.0 };
+
+        // host player gets slot 0 of own team; remotes get following slots
+        let (sp, syaw) = self.team_spawn(self.player_team, 0);
+        self.ppos = sp;
+        self.yaw = syaw;
         self.pvel = Vec3::ZERO;
         self.pitch = 0.0;
         self.php = 100;
         self.palive = true;
-        self.spec = None;
         self.cur = 0;
         for i in 0..2 {
             self.wpn[i] = WpnState {
@@ -971,26 +1053,64 @@ impl Game {
         self.plant_t = 0.0;
         self.vign = 0.0;
 
-        for b in &mut self.bots {
-            b.reset();
+        // remotes
+        let mut slot_t = if self.player_team == Team::T { 1 } else { 0 };
+        let mut slot_ct = if self.player_team == Team::Ct { 1 } else { 0 };
+        let mut spawns: Vec<(u8, Vec3, f32)> = Vec::new();
+        for r in &mut self.remotes {
+            let slot = if r.team == Team::T {
+                slot_t += 1;
+                slot_t - 1
+            } else {
+                slot_ct += 1;
+                slot_ct - 1
+            };
+            let z = if r.team == Team::T { -26.0 } else { 26.0 };
+            let yaw = if r.team == Team::T { std::f32::consts::PI } else { 0.0 };
+            let pos = vec3(SPAWN_X[slot.min(SPAWN_X.len() - 1)], 0.0, z);
+            r.pos = pos;
+            r.render_pos = pos;
+            r.hp = 100;
+            r.alive = true;
+            r.plant_p = 0.0;
+            r.defuse_p = 0.0;
+            r.spawn_seq += 1;
+            spawns.push((r.id, pos, yaw));
         }
+        if let Role::Host(net) = &self.role {
+            for (id, pos, yaw) in spawns {
+                let seq = self.remotes.iter().find(|r| r.id == id).unwrap().spawn_seq;
+                net.send_to(id, S2C::Spawn { pos: a3(pos), yaw, seq });
+            }
+        }
+
+        self.rebuild_bots();
+
         self.bomb = None;
         self.defused = false;
         self.dropped = None;
         self.explosion = None;
         self.site = if gen_range(0, 2) == 0 { SITE_A } else { SITE_B };
 
-        // bomb to random T entity (player included if T)
-        let mut t_ents: Vec<usize> = Vec::new();
+        let mut t_ents: Vec<Ent> = Vec::new();
         if self.player_team == Team::T {
-            t_ents.push(0);
+            t_ents.push(Ent::Me);
+        }
+        for r in &self.remotes {
+            if r.team == Team::T {
+                t_ents.push(Ent::Remote(r.id));
+            }
         }
         for (i, b) in self.bots.iter().enumerate() {
             if b.team == Team::T {
-                t_ents.push(i + 1);
+                t_ents.push(Ent::Bot(i));
             }
         }
-        self.carrier = Some(t_ents[gen_range(0, t_ents.len() as i32) as usize]);
+        self.carrier = if t_ents.is_empty() {
+            None
+        } else {
+            Some(t_ents[gen_range(0, t_ents.len() as i32) as usize])
+        };
 
         let site = self.site;
         let mut ct_count = 0;
@@ -1000,7 +1120,6 @@ impl Game {
                     b.goal = site + vec2(gen_range(-4.0, 4.0), gen_range(-4.0, 4.0));
                 }
                 Team::Ct => {
-                    // anchor one bot per site, extras split
                     let s = if ct_count % 2 == 0 { SITE_A } else { SITE_B };
                     ct_count += 1;
                     b.anchor = s;
@@ -1013,7 +1132,8 @@ impl Game {
         self.phase = Phase::Freeze;
         self.phase_t = FREEZE_TIME;
         self.show_msg(&format!("Round {}", self.round), 2.5);
-        if self.carrier == Some(0) {
+        self.ev_buf.push(Event::RoundMsg { round: self.round });
+        if self.carrier == Some(Ent::Me) {
             self.show_sub("You have the C4 - hold E at a site to plant", 6.0);
         }
     }
@@ -1034,6 +1154,10 @@ impl Game {
             "Terrorists win"
         };
         self.show_msg(&format!("{who} - {reason}"), 4.0);
+        self.ev_buf.push(Event::RoundEnd {
+            ct_won: winner == Team::Ct,
+            reason: reason.to_string(),
+        });
         if self.score_ct >= WIN_SCORE || self.score_t >= WIN_SCORE {
             self.match_over = true;
             self.phase_t = 6.0;
@@ -1048,13 +1172,21 @@ impl Game {
         }
     }
 
-    // ---------- player ----------
+    // ---------- shared local player movement / weapons ----------
+
+    fn local_phase_live(&self) -> bool {
+        if self.is_authority() {
+            self.phase == Phase::Live
+        } else {
+            self.cstate.snap.as_ref().map_or(false, |s| s.phase == 1)
+        }
+    }
 
     fn player_update(&mut self, dt: f32) {
         if !self.palive {
             return;
         }
-        let frozen = self.phase != Phase::Live;
+        let frozen = !self.local_phase_live();
 
         if self.dbg_noclip {
             let mut wish = Vec3::ZERO;
@@ -1118,7 +1250,6 @@ impl Game {
                 + if moving { dt * 0.012 } else { 0.0 };
             self.spread_add = self.spread_add.min(0.025);
 
-            // footsteps
             if moving && !walking && self.on_ground {
                 self.step_t -= dt;
                 if self.step_t <= 0.0 {
@@ -1130,7 +1261,6 @@ impl Game {
             }
         }
 
-        // weapons
         if self.switch_t > 0.0 {
             self.switch_t -= dt;
         }
@@ -1166,7 +1296,7 @@ impl Game {
             play(&self.snd.reload, 0.5);
         }
 
-        let busy_e = self.is_defusing() || self.is_planting();
+        let busy_e = self.local_defusing() || self.local_planting();
         let want_fire = if WPNS[c].auto {
             is_mouse_button_down(MouseButton::Left)
         } else {
@@ -1189,11 +1319,11 @@ impl Game {
             }
         }
 
-        // T player: pick up dropped bomb
-        if self.player_team == Team::T && self.carrier.is_none() {
+        // T player: pick up dropped bomb (authority handles this in sim; client trusts host)
+        if self.is_authority() && self.player_team == Team::T && self.carrier.is_none() {
             if let Some(dp) = self.dropped {
                 if self.ppos.distance(dp) < 1.6 {
-                    self.carrier = Some(0);
+                    self.carrier = Some(Ent::Me);
                     self.dropped = None;
                     self.show_sub("Picked up the C4", 3.0);
                 }
@@ -1201,27 +1331,47 @@ impl Game {
         }
     }
 
-    fn is_defusing(&self) -> bool {
-        if self.player_team != Team::Ct {
+    fn i_am_carrier(&self) -> bool {
+        if self.is_authority() {
+            self.carrier == Some(Ent::Me)
+        } else {
+            self.cstate
+                .snap
+                .as_ref()
+                .and_then(|s| s.players.iter().find(|p| p.id == self.cstate.my_id))
+                .map_or(false, |p| p.carrier)
+        }
+    }
+
+    fn bomb_view(&self) -> Option<(Vec3, f32, bool)> {
+        if self.is_authority() {
+            self.bomb.as_ref().map(|b| (b.pos, b.t, self.defused))
+        } else {
+            self.cstate
+                .snap
+                .as_ref()
+                .and_then(|s| s.bomb)
+                .map(|(p, t, d)| (v3(p), t, d))
+        }
+    }
+
+    fn local_defusing(&self) -> bool {
+        if self.player_team != Team::Ct || !self.palive || !self.local_phase_live() {
             return false;
         }
-        if let Some(b) = &self.bomb {
-            !self.defused
-                && self.palive
-                && self.phase == Phase::Live
-                && is_key_down(KeyCode::E)
-                && self.ppos.distance(b.pos) < 2.4
+        if let Some((bp, _, defused)) = self.bomb_view() {
+            !defused && is_key_down(KeyCode::E) && self.ppos.distance(bp) < 2.4
         } else {
             false
         }
     }
 
-    fn is_planting(&self) -> bool {
+    fn local_planting(&self) -> bool {
         self.player_team == Team::T
-            && self.carrier == Some(0)
+            && self.i_am_carrier()
             && self.palive
-            && self.phase == Phase::Live
-            && self.bomb.is_none()
+            && self.local_phase_live()
+            && self.bomb_view().is_none()
             && is_key_down(KeyCode::E)
             && self.near_any_site()
     }
@@ -1231,6 +1381,7 @@ impl Game {
         p.distance(SITE_A) < 4.5 || p.distance(SITE_B) < 4.5
     }
 
+    // raycast against bots + remote players (authority) or snapshot entities (client)
     fn fire_weapon(&mut self) {
         let c = self.cur;
         self.wpn[c].mag -= 1;
@@ -1247,30 +1398,59 @@ impl Game {
 
         let wall_t = nearest_wall_hit(eye, d, 300.0, &self.walls);
         let mut best_t = wall_t;
-        let mut hit_bot: Option<(usize, bool)> = None;
-        for (i, b) in self.bots.iter().enumerate() {
-            if !b.alive || b.team == self.player_team {
-                continue;
-            }
+        let mut hit: Option<(Ent, bool)> = None;
+
+        let mut test = |pos: Vec3, ent: Ent, best_t: &mut f32, hit: &mut Option<(Ent, bool)>| {
             let head = Aabb {
-                min: b.pos + vec3(-0.18, 1.4, -0.18),
-                max: b.pos + vec3(0.18, 1.75, 0.18),
+                min: pos + vec3(-0.18, 1.4, -0.18),
+                max: pos + vec3(0.18, 1.75, 0.18),
             };
             let body = Aabb {
-                min: b.pos + vec3(-0.35, 0.0, -0.35),
-                max: b.pos + vec3(0.35, 1.4, 0.35),
+                min: pos + vec3(-0.35, 0.0, -0.35),
+                max: pos + vec3(0.35, 1.4, 0.35),
             };
             if let Some(t) = ray_aabb(eye, d, &head) {
-                if t < best_t {
-                    best_t = t;
-                    hit_bot = Some((i, true));
+                if t < *best_t {
+                    *best_t = t;
+                    *hit = Some((ent, true));
                 }
             }
             if let Some(t) = ray_aabb(eye, d, &body) {
-                if t < best_t {
-                    best_t = t;
-                    hit_bot = Some((i, false));
+                if t < *best_t {
+                    *best_t = t;
+                    *hit = Some((ent, false));
                 }
+            }
+        };
+
+        if self.is_authority() {
+            for (i, b) in self.bots.iter().enumerate() {
+                if !b.alive || (!self.ff && b.team == self.player_team) {
+                    continue;
+                }
+                test(b.pos, Ent::Bot(i), &mut best_t, &mut hit);
+            }
+            for r in &self.remotes {
+                if !r.alive || (!self.ff && r.team == self.player_team) {
+                    continue;
+                }
+                test(r.pos, Ent::Remote(r.id), &mut best_t, &mut hit);
+            }
+        } else if let Some(snap) = &self.cstate.snap {
+            for (i, b) in snap.bots.iter().enumerate() {
+                if !b.alive || (!self.ff && Team::from_t(b.team_t) == self.player_team) {
+                    continue;
+                }
+                test(v3(b.pos), Ent::Bot(i), &mut best_t, &mut hit);
+            }
+            for p in &snap.players {
+                if p.id == self.cstate.my_id
+                    || !p.alive
+                    || (!self.ff && Team::from_t(p.team_t) == self.player_team)
+                {
+                    continue;
+                }
+                test(v3(p.pos), Ent::Remote(p.id), &mut best_t, &mut hit);
             }
         }
 
@@ -1283,21 +1463,108 @@ impl Game {
             play(&self.snd.pistol, 0.75);
         }
 
-        // gunfire alerts bots nearby
-        for b in &mut self.bots {
-            if b.alive && b.pos.distance(eye) < 28.0 {
-                b.alert_t = b.alert_t.max(3.0);
+        if self.is_authority() {
+            self.ev_buf.push(Event::Tracer {
+                from: a3(muzzle),
+                to: a3(end),
+            });
+            for b in &mut self.bots {
+                if b.alive && b.pos.distance(eye) < 28.0 {
+                    b.alert_t = b.alert_t.max(3.0);
+                }
             }
         }
 
-        if let Some((i, headshot)) = hit_bot {
+        if let Some((ent, headshot)) = hit {
             let dmg = if headshot { WPNS[c].dmg * 4 } else { WPNS[c].dmg };
             self.hitm = 0.12;
             play(&self.snd.hit, 0.45);
-            self.bots[i].hp -= dmg;
-            self.bots[i].alert_t = 4.0;
-            if self.bots[i].hp <= 0 && self.bots[i].alive {
-                self.kill_bot(i, "You".to_string(), self.player_team);
+            if self.is_authority() {
+                self.apply_damage(ent, dmg, "You".to_string(), self.player_team);
+            } else if let Role::Client(net) = &self.role {
+                let claim = match ent {
+                    Ent::Bot(i) => Some(HitClaim::Bot { idx: i as u8, dmg }),
+                    Ent::Remote(id) => Some(HitClaim::Player { id, dmg }),
+                    Ent::Me => None,
+                };
+                net.send(C2S::Shot(ShotMsg {
+                    from: a3(muzzle),
+                    to: a3(end),
+                    pistol: c == 1,
+                    hit: claim,
+                }));
+            }
+        } else if let Role::Client(net) = &self.role {
+            net.send(C2S::Shot(ShotMsg {
+                from: a3(muzzle),
+                to: a3(end),
+                pistol: c == 1,
+                hit: None,
+            }));
+        }
+    }
+
+    // ---------- authority: damage / deaths ----------
+
+    fn apply_damage(&mut self, target: Ent, dmg: i32, killer: String, killer_team: Team) {
+        if self.phase != Phase::Live {
+            return;
+        }
+        let dmg = dmg.clamp(0, 150);
+        match target {
+            Ent::Me => {
+                if !self.palive || self.dbg_god {
+                    return;
+                }
+                if !self.ff && killer_team == self.player_team {
+                    return;
+                }
+                self.php -= dmg;
+                self.vign = (self.vign + 0.45).min(1.0);
+                self.shake = 0.02;
+                if self.php <= 0 {
+                    self.php = 0;
+                    self.player_die(&killer, killer_team);
+                }
+            }
+            Ent::Remote(id) => {
+                let Some(ri) = self.remotes.iter().position(|r| r.id == id) else {
+                    return;
+                };
+                if !self.remotes[ri].alive {
+                    return;
+                }
+                if !self.ff && self.remotes[ri].team == killer_team {
+                    return;
+                }
+                self.remotes[ri].hp -= dmg;
+                if self.remotes[ri].hp <= 0 {
+                    self.remotes[ri].hp = 0;
+                    self.remotes[ri].alive = false;
+                    let victim = self.remotes[ri].name.clone();
+                    let pos = self.remotes[ri].pos;
+                    self.add_kill(&killer, killer_team, &victim);
+                    play(&self.snd.death, dist_vol(self.player_eye(), pos, 0.6));
+                    if self.carrier == Some(Ent::Remote(id)) {
+                        self.carrier = None;
+                        self.dropped = Some(pos);
+                    }
+                }
+            }
+            Ent::Bot(i) => {
+                if i >= self.bots.len() || !self.bots[i].alive {
+                    return;
+                }
+                if !self.ff && self.bots[i].team == killer_team {
+                    return;
+                }
+                self.bots[i].hp -= dmg;
+                self.bots[i].alert_t = 4.0;
+                self.bots[i].defusing = 0.0;
+                self.bots[i].planting = 0.0;
+                if self.bots[i].hp <= 0 {
+                    self.kill_bot(i, killer, killer_team);
+                }
             }
         }
     }
@@ -1308,27 +1575,54 @@ impl Game {
         let pos = self.bots[i].pos;
         self.add_kill(&killer, killer_team, &victim);
         play(&self.snd.death, dist_vol(self.player_eye(), pos, 0.6));
-        if Some(i + 1) == self.carrier {
+        if self.carrier == Some(Ent::Bot(i)) {
             self.carrier = None;
             self.dropped = Some(pos);
         }
     }
 
-    // ---------- bots ----------
+    fn player_die(&mut self, killer: &str, killer_team: Team) {
+        self.palive = false;
+        self.add_kill(killer, killer_team, "You");
+        play(&self.snd.death, 0.8);
+        self.show_sub("You died - LMB / Space to cycle spectate", 4.0);
+        if self.carrier == Some(Ent::Me) {
+            self.carrier = None;
+            self.dropped = Some(self.ppos);
+        }
+        self.spec_i = 0;
+    }
 
-    fn bots_update(&mut self, dt: f32) {
-        let snaps: Vec<Snap> = std::iter::once(Snap {
+    // ---------- authority: bots + remote players sim ----------
+
+    fn build_sim_snaps(&self) -> Vec<SimSnap> {
+        let mut v = vec![SimSnap {
+            ent: Ent::Me,
             eye: self.player_eye(),
             alive: self.palive,
             team: self.player_team,
-        })
-        .chain(self.bots.iter().map(|b| Snap {
-            eye: b.eye(),
-            alive: b.alive,
-            team: b.team,
-        }))
-        .collect();
+        }];
+        for r in &self.remotes {
+            v.push(SimSnap {
+                ent: Ent::Remote(r.id),
+                eye: r.eye(),
+                alive: r.alive,
+                team: r.team,
+            });
+        }
+        for (i, b) in self.bots.iter().enumerate() {
+            v.push(SimSnap {
+                ent: Ent::Bot(i),
+                eye: b.eye(),
+                alive: b.alive,
+                team: b.team,
+            });
+        }
+        v
+    }
 
+    fn bots_update(&mut self, dt: f32) {
+        let snaps = self.build_sim_snaps();
         let mut events: Vec<DmgEvent> = Vec::new();
         let mut shot_positions: Vec<Vec3> = Vec::new();
         let bomb_planted = self.bomb.is_some() && !self.defused;
@@ -1337,7 +1631,7 @@ impl Game {
         let site = self.site;
 
         let mut planted_now: Option<Vec3> = None;
-        let mut defused_now: Option<&'static str> = None;
+        let mut defused_now: Option<String> = None;
         let mut pickup: Option<usize> = None;
 
         for i in 0..self.bots.len() {
@@ -1347,45 +1641,44 @@ impl Game {
             }
             b.alert_t = (b.alert_t - dt).max(0.0);
 
-            // targeting: vision cone + hearing + alert
             b.think -= dt;
             if b.think <= 0.0 {
                 b.think = 0.1 + gen_range(0.0, 0.08);
                 let my_eye = b.eye();
                 let facing = vec3(-b.yaw.sin(), 0.0, -b.yaw.cos());
-                let mut best: Option<(usize, f32)> = None;
-                for (j, s) in snaps.iter().enumerate() {
-                    if j == i + 1 || !s.alive || s.team == b.team {
+                let mut best: Option<(Ent, f32)> = None;
+                for s in &snaps {
+                    if s.ent == Ent::Bot(i) || !s.alive || s.team == b.team {
                         continue;
                     }
                     let to = s.eye - my_eye;
-                    let d = to.length();
-                    if d > 55.0 {
+                    let dist = to.length();
+                    if dist > 55.0 {
                         continue;
                     }
-                    let already = b.target == Some(j);
-                    if !already && b.alert_t <= 0.0 && d > 9.0 {
+                    let already = b.target == Some(s.ent);
+                    if !already && b.alert_t <= 0.0 && dist > 9.0 {
                         let flat = vec3(to.x, 0.0, to.z).normalize_or_zero();
                         if facing.dot(flat) < 0.57 {
-                            continue; // outside ~110 degree cone, didn't hear anything
+                            continue;
                         }
                     }
                     if !los_clear(my_eye, s.eye, &self.walls) {
                         continue;
                     }
-                    if best.map_or(true, |(_, bd)| d < bd) {
-                        best = Some((j, d));
+                    if best.map_or(true, |(_, bd)| dist < bd) {
+                        best = Some((s.ent, dist));
                     }
                 }
                 match (b.target, best) {
-                    (None, Some((j, _))) => {
-                        b.target = Some(j);
+                    (None, Some((e, _))) => {
+                        b.target = Some(e);
                         b.react = 0.5 + gen_range(0.0, 0.5);
                         b.can_see = true;
                         b.lost_t = 0.0;
                     }
-                    (Some(_), Some((j, _))) => {
-                        b.target = Some(j);
+                    (Some(_), Some((e, _))) => {
+                        b.target = Some(e);
                         b.can_see = true;
                         b.lost_t = 0.0;
                     }
@@ -1400,12 +1693,14 @@ impl Game {
                 }
             }
 
-            let in_combat = b.target.is_some() && b.can_see;
+            let tsnap = b
+                .target
+                .and_then(|t| snaps.iter().find(|s| s.ent == t).copied())
+                .filter(|s| s.alive);
+            let in_combat = tsnap.is_some() && b.can_see;
 
-            if in_combat {
-                let tgt = b.target.unwrap();
-                let tsnap = snaps[tgt];
-                let to = tsnap.eye - b.eye();
+            if let (true, Some(ts)) = (in_combat, tsnap) {
+                let to = ts.eye - b.eye();
                 let dist = to.length();
                 b.yaw = angle_lerp(b.yaw, (-to.x).atan2(-to.z), 0.18);
                 if b.react > 0.0 {
@@ -1419,10 +1714,10 @@ impl Game {
                             b.burst_cd = 0.7 + gen_range(0.0, 0.7);
                         }
                         let p_hit = (0.20 - dist * 0.0033).clamp(0.04, 0.20);
-                        let hit = gen_range(0.0, 1.0) < p_hit;
+                        let hit_roll = gen_range(0.0, 1.0) < p_hit;
                         let muzzle = b.eye() + to.normalize() * 0.5;
-                        let jitter = if hit { 0.12 } else { 1.4 };
-                        let aim = tsnap.eye
+                        let jitter = if hit_roll { 0.12 } else { 1.4 };
+                        let aim = ts.eye
                             + vec3(
                                 gen_range(-jitter, jitter),
                                 gen_range(-jitter, jitter),
@@ -1431,19 +1726,22 @@ impl Game {
                         self.tracers.push((muzzle, aim, 0.05));
                         self.flashes.push((muzzle, 0.04));
                         shot_positions.push(muzzle);
+                        self.ev_buf.push(Event::Tracer {
+                            from: a3(muzzle),
+                            to: a3(aim),
+                        });
                         let vol = dist_vol(player_eye, muzzle, 0.8);
                         if muzzle.distance(player_eye) > 28.0 {
                             play(&self.snd.far, vol);
                         } else {
                             play(&self.snd.ak, vol * 0.8);
                         }
-                        if hit {
+                        if hit_roll {
                             events.push(DmgEvent {
-                                target: tgt,
+                                target: ts.ent,
                                 dmg: gen_range(14, 26),
                                 killer: b.name.to_string(),
                                 killer_team: b.team,
-                                shooter_pos: muzzle,
                             });
                         }
                     }
@@ -1458,8 +1756,7 @@ impl Game {
                 b.defusing = 0.0;
             }
 
-            // objectives
-            let is_carrier = Some(i + 1) == self.carrier;
+            let is_carrier = self.carrier == Some(Ent::Bot(i));
             if !in_combat {
                 match b.team {
                     Team::T => {
@@ -1504,7 +1801,7 @@ impl Game {
                                 if vec2(b.pos.x, b.pos.z).distance(b.goal) < 2.0 {
                                     b.defusing += dt;
                                     if b.defusing >= BOT_DEFUSE_TIME {
-                                        defused_now = Some(b.name);
+                                        defused_now = Some(b.name.to_string());
                                     }
                                 } else {
                                     b.defusing = 0.0;
@@ -1521,7 +1818,6 @@ impl Game {
                 }
             }
 
-            // movement
             let busy = b.planting > 0.0 || b.defusing > 0.0;
             let mut step = Vec3::ZERO;
             if in_combat {
@@ -1553,7 +1849,6 @@ impl Game {
                     }
                 }
             }
-            // bot footsteps
             if step.length_squared() > 0.0 {
                 b.step_t -= dt;
                 if b.step_t <= 0.0 {
@@ -1569,7 +1864,6 @@ impl Game {
             b.vy = vy;
         }
 
-        // gunfire alerts bots near shooters
         for sp in shot_positions {
             for b in &mut self.bots {
                 if b.alive && b.pos.distance(sp) < 22.0 {
@@ -1579,81 +1873,81 @@ impl Game {
         }
 
         if let Some(i) = pickup {
-            self.carrier = Some(i + 1);
+            self.carrier = Some(Ent::Bot(i));
             self.dropped = None;
         }
         if let Some(pos) = planted_now {
             self.plant_bomb(pos);
         }
         if let Some(name) = defused_now {
-            self.defused = true;
-            play(&self.snd.defused, 0.9);
-            self.show_sub(&format!("{name} defused the bomb"), 4.0);
-            self.end_round(Team::Ct, "bomb defused");
+            self.finish_defuse(&name);
         }
 
-        // damage application
         for ev in events {
-            if self.phase != Phase::Live {
-                break;
-            }
-            if ev.target == 0 {
-                if !self.palive || self.dbg_god {
-                    continue;
-                }
-                self.php -= ev.dmg;
-                self.vign = (self.vign + 0.45).min(1.0);
-                self.shake = 0.02;
-                if self.php <= 0 {
-                    self.php = 0;
-                    self.player_die(&ev.killer, ev.killer_team);
-                }
-            } else {
-                let bi = ev.target - 1;
-                if !self.bots[bi].alive || self.bots[bi].team == ev.killer_team {
-                    continue;
-                }
-                self.bots[bi].hp -= ev.dmg;
-                self.bots[bi].alert_t = 4.0;
-                self.bots[bi].defusing = 0.0;
-                self.bots[bi].planting = 0.0;
-                let _ = ev.shooter_pos;
-                if self.bots[bi].hp <= 0 {
-                    self.kill_bot(bi, ev.killer, ev.killer_team);
-                }
-            }
+            self.apply_damage(ev.target, ev.dmg, ev.killer, ev.killer_team);
         }
     }
 
-    fn player_die(&mut self, killer: &str, killer_team: Team) {
-        self.palive = false;
-        self.add_kill(killer, killer_team, "You");
-        play(&self.snd.death, 0.8);
-        self.show_sub("You died - LMB / Space to cycle spectate", 4.0);
-        if self.carrier == Some(0) {
-            self.carrier = None;
-            self.dropped = Some(self.ppos);
-        }
-        self.spec = self.next_spec(None);
-    }
+    // remote players: pickup, plant, defuse (authority)
+    fn remotes_update(&mut self, dt: f32) {
+        let bomb_view = self.bomb.as_ref().map(|b| (b.pos, self.defused));
+        let mut planted: Option<Vec3> = None;
+        let mut defused_by: Option<String> = None;
+        let mut picked: Option<u8> = None;
+        let dropped = self.dropped;
+        let carrier = self.carrier;
 
-    fn next_spec(&self, after: Option<usize>) -> Option<usize> {
-        let n = self.bots.len();
-        let start = after.map(|i| i + 1).unwrap_or(0);
-        for k in 0..n {
-            let i = (start + k) % n;
-            if self.bots[i].alive && self.bots[i].team == self.player_team {
-                return Some(i);
+        for r in &mut self.remotes {
+            // smooth render pos
+            r.render_pos = r.render_pos.lerp(r.pos, (dt * 14.0).min(1.0));
+            r.render_yaw = angle_lerp(r.render_yaw, r.yaw, (dt * 14.0).min(1.0));
+            if !r.alive {
+                r.plant_p = 0.0;
+                r.defuse_p = 0.0;
+                continue;
+            }
+
+            let flat = vec2(r.pos.x, r.pos.z);
+            let near_site = flat.distance(SITE_A) < 4.5 || flat.distance(SITE_B) < 4.5;
+
+            if r.team == Team::T {
+                if carrier.is_none() && picked.is_none() {
+                    if let Some(dp) = dropped {
+                        if r.pos.distance(dp) < 1.6 {
+                            picked = Some(r.id);
+                        }
+                    }
+                }
+                if carrier == Some(Ent::Remote(r.id)) && bomb_view.is_none() && r.e_held && near_site {
+                    r.plant_p += dt;
+                    if r.plant_p >= PLANT_TIME && planted.is_none() {
+                        planted = Some(r.pos);
+                    }
+                } else {
+                    r.plant_p = 0.0;
+                }
+            } else if let Some((bp, defused)) = bomb_view {
+                if !defused && r.e_held && r.pos.distance(bp) < 2.4 {
+                    r.defuse_p += dt;
+                    if r.defuse_p >= DEFUSE_TIME && defused_by.is_none() {
+                        defused_by = Some(r.name.clone());
+                    }
+                } else {
+                    r.defuse_p = 0.0;
+                }
             }
         }
-        // no teammates: spectate anyone alive
-        for k in 0..n {
-            let i = (start + k) % n;
-            if self.bots[i].alive {
-                return Some(i);
-            }
+
+        if let Some(id) = picked {
+            self.carrier = Some(Ent::Remote(id));
+            self.dropped = None;
         }
-        None
+        if let Some(pos) = planted {
+            self.plant_bomb(pos);
+        }
+        if let Some(name) = defused_by {
+            self.finish_defuse(&name);
+        }
     }
 
     fn plant_bomb(&mut self, pos: Vec3) {
@@ -1665,31 +1959,39 @@ impl Game {
         self.carrier = None;
         self.show_msg("The bomb has been planted", 3.0);
         play(&self.snd.planted, 0.8);
+        self.ev_buf.push(Event::Planted);
     }
 
-    // ---------- bomb / round flow ----------
+    fn finish_defuse(&mut self, by: &str) {
+        if self.defused {
+            return;
+        }
+        self.defused = true;
+        play(&self.snd.defused, 0.9);
+        self.show_sub(&format!("{by} defused the bomb"), 4.0);
+        self.ev_buf.push(Event::Defused { by: by.to_string() });
+        self.end_round(Team::Ct, "bomb defused");
+    }
 
     fn bomb_update(&mut self, dt: f32) {
-        // player defuse
-        if self.is_defusing() {
+        if self.local_defusing() && self.is_authority() {
             self.defuse_t += dt;
             if self.defuse_t >= DEFUSE_TIME && !self.defused {
-                self.defused = true;
-                play(&self.snd.defused, 0.9);
-                self.end_round(Team::Ct, "you defused the bomb");
+                self.finish_defuse("You");
             }
-        } else {
+        } else if self.is_authority() {
             self.defuse_t = 0.0;
         }
-        // player plant
-        if self.is_planting() {
-            self.plant_t += dt;
-            if self.plant_t >= PLANT_TIME && self.bomb.is_none() {
-                self.plant_bomb(self.ppos);
+        if self.is_authority() {
+            if self.local_planting() {
+                self.plant_t += dt;
+                if self.plant_t >= PLANT_TIME && self.bomb.is_none() {
+                    self.plant_bomb(self.ppos);
+                    self.plant_t = 0.0;
+                }
+            } else {
                 self.plant_t = 0.0;
             }
-        } else {
-            self.plant_t = 0.0;
         }
 
         let mut exploded = false;
@@ -1712,32 +2014,69 @@ impl Game {
         }
         if exploded {
             let bp = self.bomb.as_ref().unwrap().pos;
-            self.explosion = Some((bp, 0.0));
-            play(&self.snd.explosion, 1.0);
-            self.shake = 0.3;
-            let d = self.ppos.distance(bp);
-            if self.palive && d < 22.0 && !self.dbg_god {
-                let dmg = ((1.0 - d / 22.0) * 180.0) as i32;
-                self.php -= dmg;
-                self.vign = 1.0;
-                if self.php <= 0 {
-                    self.php = 0;
-                    self.player_die("C4", Team::T);
-                }
-            }
+            self.run_explosion(bp);
             self.bomb = None;
             self.end_round(Team::T, "target destroyed");
         }
+    }
+
+    fn run_explosion(&mut self, bp: Vec3) {
+        self.explosion = Some((bp, 0.0));
+        play(&self.snd.explosion, 1.0);
+        self.shake = 0.3;
+        self.ev_buf.push(Event::Explosion { pos: a3(bp) });
+        let radius = 22.0;
+        let d = self.ppos.distance(bp);
+        if self.palive && d < radius && !self.dbg_god {
+            let dmg = ((1.0 - d / radius) * 180.0) as i32;
+            self.php -= dmg;
+            self.vign = 1.0;
+            if self.php <= 0 {
+                self.php = 0;
+                self.player_die("C4", Team::T);
+            }
+        }
+        for ri in 0..self.remotes.len() {
+            let d = self.remotes[ri].pos.distance(bp);
+            if self.remotes[ri].alive && d < radius {
+                let dmg = ((1.0 - d / radius) * 180.0) as i32;
+                let id = self.remotes[ri].id;
+                self.apply_damage_ff_exempt(Ent::Remote(id), dmg);
+            }
+        }
+        for i in 0..self.bots.len() {
+            let d = self.bots[i].pos.distance(bp);
+            if self.bots[i].alive && d < radius {
+                let dmg = ((1.0 - d / radius) * 180.0) as i32;
+                self.apply_damage_ff_exempt(Ent::Bot(i), dmg);
+            }
+        }
+    }
+
+    fn apply_damage_ff_exempt(&mut self, target: Ent, dmg: i32) {
+        let saved = self.ff;
+        self.ff = true;
+        self.apply_damage(target, dmg, "C4".to_string(), Team::T);
+        self.ff = saved;
     }
 
     fn check_round_end(&mut self) {
         if self.phase != Phase::Live {
             return;
         }
-        let ts_alive = self.bots.iter().any(|b| b.team == Team::T && b.alive)
+        let mut ts_alive = self.bots.iter().any(|b| b.team == Team::T && b.alive)
             || (self.player_team == Team::T && self.palive);
-        let cts_alive = self.bots.iter().any(|b| b.team == Team::Ct && b.alive)
+        let mut cts_alive = self.bots.iter().any(|b| b.team == Team::Ct && b.alive)
             || (self.player_team == Team::Ct && self.palive);
+        for r in &self.remotes {
+            if r.alive {
+                if r.team == Team::T {
+                    ts_alive = true;
+                } else {
+                    cts_alive = true;
+                }
+            }
+        }
         let planted = self.bomb.is_some() && !self.defused;
         if !cts_alive {
             self.end_round(Team::T, "Counter-Terrorists eliminated");
@@ -1748,45 +2087,374 @@ impl Game {
         }
     }
 
-    // ---------- debug ----------
+    // ---------- networking glue ----------
 
-    fn debug_input(&mut self) {
-        if is_key_pressed(KeyCode::F10) {
-            self.dbg_open = !self.dbg_open;
-        }
-        if !self.dbg_open {
-            return;
-        }
-        if is_key_pressed(KeyCode::F1) {
-            self.dbg_god = !self.dbg_god;
-        }
-        if is_key_pressed(KeyCode::F2) {
-            self.dbg_noclip = !self.dbg_noclip;
-        }
-        if is_key_pressed(KeyCode::F3) {
-            self.dbg_esp = !self.dbg_esp;
-        }
-        if is_key_pressed(KeyCode::F4) {
-            self.dbg_paths = !self.dbg_paths;
-        }
-        if is_key_pressed(KeyCode::F5) {
-            self.dbg_freeze = !self.dbg_freeze;
-        }
-        if is_key_pressed(KeyCode::F6) {
-            let enemy = if self.player_team == Team::Ct { Team::T } else { Team::Ct };
-            for i in 0..self.bots.len() {
-                if self.bots[i].alive && self.bots[i].team == enemy {
-                    self.kill_bot(i, "Debug".to_string(), self.player_team);
+    fn host_poll(&mut self, _dt: f32) {
+        let Role::Host(_) = &self.role else { return };
+        let mut joined: Vec<(u8, String, bool)> = Vec::new();
+        let mut left: Vec<u8> = Vec::new();
+        let mut inputs: Vec<(u8, PlayerInput)> = Vec::new();
+        let mut shots: Vec<(u8, ShotMsg)> = Vec::new();
+        if let Role::Host(net) = &self.role {
+            while let Ok(ev) = net.events.try_recv() {
+                match ev {
+                    HostEvent::Ticket(t) => {
+                        println!("HOST TICKET: {t}");
+                        macroquad::miniquad::window::clipboard_set(&t);
+                        self.ticket = Some(t);
+                    }
+                    HostEvent::Joined { id, name, want_t } => joined.push((id, name, want_t)),
+                    HostEvent::Msg { id, msg } => match msg {
+                        C2S::Input(inp) => inputs.push((id, inp)),
+                        C2S::Shot(s) => shots.push((id, s)),
+                        C2S::Hello { .. } => {}
+                    },
+                    HostEvent::Left { id } => left.push(id),
                 }
             }
         }
-        if is_key_pressed(KeyCode::F7) {
-            self.php = 100;
-            self.palive = true;
-            for i in 0..2 {
-                self.wpn[i].mag = WPNS[i].mag_size;
-                self.wpn[i].reserve = WPNS[i].reserve_start;
+
+        for (id, name, want_t) in joined {
+            let team = Team::from_t(want_t);
+            let slot = 1 + self.remotes.iter().filter(|r| r.team == team).count();
+            let (pos, yaw) = self.team_spawn(team, slot);
+            let mut rp = RPlayer {
+                id,
+                name: name.clone(),
+                team,
+                pos,
+                yaw,
+                hp: 100,
+                alive: true,
+                e_held: false,
+                weapon: 0,
+                plant_p: 0.0,
+                defuse_p: 0.0,
+                spawn_seq: 1,
+                render_pos: pos,
+                render_yaw: yaw,
+                step_acc: 0.0,
+            };
+            rp.render_pos = pos;
+            self.remotes.push(rp);
+            if let Role::Host(net) = &self.role {
+                net.send_to(id, S2C::Welcome { id, team_t: want_t, ff: self.ff });
+                net.send_to(id, S2C::Spawn { pos: a3(pos), yaw, seq: 1 });
             }
+            self.show_sub(&format!("{name} joined"), 3.0);
+            println!("player joined: {name} (id {id})");
+        }
+
+        for id in left {
+            if let Some(i) = self.remotes.iter().position(|r| r.id == id) {
+                let name = self.remotes[i].name.clone();
+                if self.carrier == Some(Ent::Remote(id)) {
+                    self.carrier = None;
+                    self.dropped = Some(self.remotes[i].pos);
+                }
+                self.remotes.remove(i);
+                self.show_sub(&format!("{name} left"), 3.0);
+                println!("player left: {name} (id {id})");
+            }
+        }
+
+        for (id, inp) in inputs {
+            if let Some(r) = self.remotes.iter_mut().find(|r| r.id == id) {
+                if inp.alive_seq == r.spawn_seq && r.alive {
+                    let p = v3(inp.pos);
+                    // sanity clamp inside arena
+                    r.pos = vec3(p.x.clamp(-40.0, 40.0), p.y.clamp(0.0, 10.0), p.z.clamp(-30.0, 30.0));
+                    r.yaw = inp.yaw;
+                    r.e_held = inp.e_held;
+                    r.weapon = inp.weapon;
+                }
+            }
+        }
+
+        for (id, s) in shots {
+            let Some(r) = self.remotes.iter().find(|r| r.id == id) else {
+                continue;
+            };
+            if !r.alive || self.phase != Phase::Live {
+                continue;
+            }
+            let shooter_name = r.name.clone();
+            let shooter_team = r.team;
+            let from = v3(s.from);
+            let to = v3(s.to);
+            self.tracers.push((from, to, 0.05));
+            self.ev_buf.push(Event::Tracer { from: s.from, to: s.to });
+            let vol = dist_vol(self.player_eye(), from, 0.8);
+            if s.pistol {
+                play(&self.snd.pistol, vol * 0.9);
+            } else {
+                play(&self.snd.ak, vol * 0.9);
+            }
+            for b in &mut self.bots {
+                if b.alive && b.pos.distance(from) < 28.0 {
+                    b.alert_t = b.alert_t.max(3.0);
+                }
+            }
+            if let Some(claim) = s.hit {
+                match claim {
+                    HitClaim::Bot { idx, dmg } => {
+                        self.apply_damage(Ent::Bot(idx as usize), dmg, shooter_name, shooter_team)
+                    }
+                    HitClaim::Player { id: tid, dmg } => {
+                        let target = if tid == 0 { Ent::Me } else { Ent::Remote(tid) };
+                        self.apply_damage(target, dmg, shooter_name, shooter_team)
+                    }
+                }
+            }
+        }
+    }
+
+    fn host_broadcast(&mut self, dt: f32) {
+        let Role::Host(_) = &self.role else {
+            self.ev_buf.clear();
+            return;
+        };
+        self.snap_timer -= dt;
+        if self.snap_timer > 0.0 {
+            return;
+        }
+        self.snap_timer = NET_RATE;
+
+        let mut players = vec![PlayerNet {
+            id: 0,
+            name: self.my_name.clone(),
+            team_t: self.player_team.is_t(),
+            pos: a3(self.ppos),
+            yaw: self.yaw,
+            alive: self.palive,
+            hp: self.php,
+            carrier: self.carrier == Some(Ent::Me),
+            progress: (self.defuse_t / DEFUSE_TIME).max(self.plant_t / PLANT_TIME),
+        }];
+        for r in &self.remotes {
+            players.push(PlayerNet {
+                id: r.id,
+                name: r.name.clone(),
+                team_t: r.team.is_t(),
+                pos: a3(r.pos),
+                yaw: r.yaw,
+                alive: r.alive,
+                hp: r.hp,
+                carrier: self.carrier == Some(Ent::Remote(r.id)),
+                progress: (r.plant_p / PLANT_TIME).max(r.defuse_p / DEFUSE_TIME),
+            });
+        }
+        let bots = self
+            .bots
+            .iter()
+            .enumerate()
+            .map(|(i, b)| BotNet {
+                name: b.name.to_string(),
+                team_t: b.team.is_t(),
+                pos: a3(b.pos),
+                yaw: b.yaw,
+                alive: b.alive,
+                carrier: self.carrier == Some(Ent::Bot(i)),
+            })
+            .collect();
+        let snap = Snapshot {
+            players,
+            bots,
+            bomb: self.bomb.as_ref().map(|b| (a3(b.pos), b.t, self.defused)),
+            dropped: self.dropped.map(a3),
+            phase: match self.phase {
+                Phase::Freeze => 0,
+                Phase::Live => 1,
+                _ => 2,
+            },
+            round_time: self.round_time,
+            score_ct: self.score_ct,
+            score_t: self.score_t,
+            round: self.round,
+            events: std::mem::take(&mut self.ev_buf),
+        };
+        if let Role::Host(net) = &self.role {
+            net.broadcast(S2C::Snap(snap));
+        }
+    }
+
+    fn client_poll(&mut self) {
+        let Role::Client(_) = &self.role else { return };
+        let mut msgs: Vec<S2C> = Vec::new();
+        let mut disconnect: Option<String> = None;
+        if let Role::Client(net) = &self.role {
+            while let Ok(ev) = net.events.try_recv() {
+                match ev {
+                    ClientEvent::Connected => {}
+                    ClientEvent::Msg(m) => msgs.push(m),
+                    ClientEvent::Disconnected(why) => disconnect = Some(why),
+                }
+            }
+        }
+        if let Some(why) = disconnect {
+            self.cstate.disconnect = Some(why);
+        }
+        for m in msgs {
+            match m {
+                S2C::Welcome { id, team_t, ff } => {
+                    self.cstate.my_id = id;
+                    self.cstate.welcomed = true;
+                    self.player_team = Team::from_t(team_t);
+                    self.ff = ff;
+                    if self.phase == Phase::Menu {
+                        self.phase = Phase::Live; // actual phase comes from snapshots
+                    }
+                }
+                S2C::Spawn { pos, yaw, seq } => {
+                    self.ppos = v3(pos);
+                    self.yaw = yaw;
+                    self.pitch = 0.0;
+                    self.pvel = Vec3::ZERO;
+                    self.palive = true;
+                    self.php = 100;
+                    self.cstate.spawn_seq = seq;
+                    self.cstate.prev_alive = true;
+                    self.cstate.prev_hp = 100;
+                    for i in 0..2 {
+                        self.wpn[i] = WpnState {
+                            mag: WPNS[i].mag_size,
+                            reserve: WPNS[i].reserve_start,
+                            reload_t: 0.0,
+                            cd: 0.0,
+                        };
+                    }
+                    self.defuse_t = 0.0;
+                    self.plant_t = 0.0;
+                    self.vign = 0.0;
+                }
+                S2C::Snap(snap) => self.client_apply_snap(snap),
+            }
+        }
+    }
+
+    fn client_apply_snap(&mut self, snap: Snapshot) {
+        let my_eye = self.player_eye();
+        for ev in &snap.events {
+            match ev {
+                Event::Kill { killer, killer_ct, victim } => {
+                    let me = self
+                        .cstate
+                        .snap
+                        .as_ref()
+                        .and_then(|s| s.players.iter().find(|p| p.id == self.cstate.my_id))
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default();
+                    let victim_disp = if *victim == me { "You".to_string() } else { victim.clone() };
+                    let killer_disp = if *killer == me { "You".to_string() } else { killer.clone() };
+                    let team = if *killer_ct { Team::Ct } else { Team::T };
+                    let c = if *killer_ct {
+                        Color::from_rgba(120, 180, 255, 255)
+                    } else {
+                        Color::from_rgba(255, 180, 110, 255)
+                    };
+                    self.killfeed.push((format!("{killer_disp} > {victim_disp}"), c, 5.0));
+                    if self.killfeed.len() > 6 {
+                        self.killfeed.remove(0);
+                    }
+                    let _ = team;
+                }
+                Event::Tracer { from, to } => {
+                    let f = v3(*from);
+                    if f.distance(my_eye) > 1.5 {
+                        self.tracers.push((f, v3(*to), 0.05));
+                        let vol = dist_vol(my_eye, f, 0.8);
+                        if f.distance(my_eye) > 28.0 {
+                            play(&self.snd.far, vol);
+                        } else {
+                            play(&self.snd.ak, vol * 0.8);
+                        }
+                    }
+                }
+                Event::Planted => {
+                    self.show_msg("The bomb has been planted", 3.0);
+                    play(&self.snd.planted, 0.8);
+                }
+                Event::Defused { by } => {
+                    play(&self.snd.defused, 0.9);
+                    self.show_sub(&format!("{by} defused the bomb"), 4.0);
+                }
+                Event::Explosion { pos } => {
+                    let p = v3(*pos);
+                    self.explosion = Some((p, 0.0));
+                    play(&self.snd.explosion, 1.0);
+                    self.shake = 0.3;
+                }
+                Event::RoundEnd { ct_won, reason } => {
+                    let who = if *ct_won {
+                        "Counter-Terrorists win"
+                    } else {
+                        "Terrorists win"
+                    };
+                    self.show_msg(&format!("{who} - {reason}"), 4.0);
+                }
+                Event::RoundMsg { round } => {
+                    self.show_msg(&format!("Round {round}"), 2.5);
+                }
+            }
+        }
+
+        // own authoritative state
+        if let Some(me) = snap.players.iter().find(|p| p.id == self.cstate.my_id) {
+            if me.hp < self.cstate.prev_hp && me.alive {
+                self.vign = (self.vign + 0.45).min(1.0);
+                self.shake = 0.02;
+            }
+            self.php = me.hp;
+            if self.cstate.prev_alive && !me.alive {
+                self.palive = false;
+                play(&self.snd.death, 0.8);
+                self.show_sub("You died - LMB / Space to cycle spectate", 4.0);
+            }
+            self.cstate.prev_hp = me.hp;
+            self.cstate.prev_alive = me.alive;
+            if me.carrier && self.bomb_view().is_none() && self.sub_t <= 0.0 && self.msg_t <= 0.0 {
+                // gentle reminder handled by HUD C4 indicator instead
+            }
+        }
+
+        // remote entity footsteps, derived from movement
+        if let Some(prev) = &self.cstate.snap {
+            for p in &snap.players {
+                if p.id == self.cstate.my_id || !p.alive {
+                    continue;
+                }
+                if let Some(pp) = prev.players.iter().find(|q| q.id == p.id) {
+                    let moved = v3(p.pos).distance(v3(pp.pos));
+                    let e = self.cstate.step_acc.entry(p.id).or_insert((v3(p.pos), 0.0));
+                    e.1 += moved;
+                    if e.1 > 2.4 {
+                        e.1 = 0.0;
+                        play(&self.snd.step, dist_vol(my_eye, v3(p.pos), 0.4));
+                    }
+                }
+            }
+        }
+
+        self.cstate.snap = Some(snap);
+    }
+
+    fn client_send_input(&mut self, dt: f32) {
+        let Role::Client(_) = &self.role else { return };
+        self.input_timer -= dt;
+        if self.input_timer > 0.0 {
+            return;
+        }
+        self.input_timer = NET_RATE;
+        let inp = PlayerInput {
+            pos: a3(self.ppos),
+            yaw: self.yaw,
+            pitch: self.pitch,
+            weapon: self.cur as u8,
+            e_held: is_key_down(KeyCode::E) && self.palive,
+            alive_seq: self.cstate.spawn_seq,
+        };
+        if let Role::Client(net) = &self.role {
+            net.send(C2S::Input(inp));
         }
     }
 
@@ -1823,56 +2491,144 @@ impl Game {
         });
     }
 
-    fn draw_bot(&self, b: &Bot, idx: usize) {
-        let body_c = if b.team == Team::T {
+    fn draw_character(&self, e: &DrawEnt) {
+        let body_c = if e.team == Team::T {
             Color::from_rgba(196, 142, 58, 255)
         } else {
             Color::from_rgba(72, 110, 195, 255)
         };
         let skin = Color::from_rgba(214, 178, 138, 255);
         self.draw_obox(
-            b.pos + vec3(0.0, 0.015, 0.0),
-            b.yaw,
+            e.pos + vec3(0.0, 0.015, 0.0),
+            e.yaw,
             vec3(0.45, 0.001, 0.45),
             Color::new(0.0, 0.0, 0.0, 0.3),
         );
         self.draw_obox(
-            b.pos + vec3(0.0, 0.3, 0.0),
-            b.yaw,
+            e.pos + vec3(0.0, 0.3, 0.0),
+            e.yaw,
             vec3(0.26, 0.3, 0.17),
             shade(body_c, 0.6),
         );
-        self.draw_obox(b.pos + vec3(0.0, 1.0, 0.0), b.yaw, vec3(0.33, 0.42, 0.2), body_c);
-        self.draw_obox(b.pos + vec3(0.0, 1.58, 0.0), b.yaw, vec3(0.16, 0.17, 0.16), skin);
-        let (s, co) = b.yaw.sin_cos();
+        self.draw_obox(e.pos + vec3(0.0, 1.0, 0.0), e.yaw, vec3(0.33, 0.42, 0.2), body_c);
+        self.draw_obox(e.pos + vec3(0.0, 1.58, 0.0), e.yaw, vec3(0.16, 0.17, 0.16), skin);
+        let (s, co) = e.yaw.sin_cos();
         let fwd = vec3(-s, 0.0, -co);
         let right = vec3(co, 0.0, -s);
         self.draw_obox(
-            b.pos + vec3(0.0, 1.25, 0.0) + fwd * 0.45 + right * 0.12,
-            b.yaw,
+            e.pos + vec3(0.0, 1.25, 0.0) + fwd * 0.45 + right * 0.12,
+            e.yaw,
             vec3(0.045, 0.06, 0.34),
             Color::from_rgba(40, 38, 36, 255),
         );
-        if Some(idx + 1) == self.carrier {
+        if e.carrier {
             self.draw_obox(
-                b.pos + vec3(0.0, 1.05, 0.0) - fwd * 0.3,
-                b.yaw,
+                e.pos + vec3(0.0, 1.05, 0.0) - fwd * 0.3,
+                e.yaw,
                 vec3(0.16, 0.22, 0.08),
                 Color::from_rgba(90, 30, 25, 255),
             );
         }
     }
 
-    fn draw_world(&self, t_now: f64) {
+    fn collect_draw_ents(&self) -> Vec<DrawEnt> {
+        let mut out = Vec::new();
+        if self.is_authority() {
+            for (i, b) in self.bots.iter().enumerate() {
+                if b.alive {
+                    out.push(DrawEnt {
+                        pos: b.pos,
+                        yaw: b.yaw,
+                        team: b.team,
+                        carrier: self.carrier == Some(Ent::Bot(i)),
+                        name: String::new(),
+                        hp: b.hp,
+                    });
+                }
+            }
+            for r in &self.remotes {
+                if r.alive {
+                    out.push(DrawEnt {
+                        pos: r.render_pos,
+                        yaw: r.render_yaw,
+                        team: r.team,
+                        carrier: self.carrier == Some(Ent::Remote(r.id)),
+                        name: r.name.clone(),
+                        hp: r.hp,
+                    });
+                }
+            }
+        } else if let Some(snap) = &self.cstate.snap {
+            for b in &snap.bots {
+                if b.alive {
+                    out.push(DrawEnt {
+                        pos: v3(b.pos),
+                        yaw: b.yaw,
+                        team: Team::from_t(b.team_t),
+                        carrier: b.carrier,
+                        name: String::new(),
+                        hp: 100,
+                    });
+                }
+            }
+            for p in &snap.players {
+                if p.alive && p.id != self.cstate.my_id {
+                    out.push(DrawEnt {
+                        pos: v3(p.pos),
+                        yaw: p.yaw,
+                        team: Team::from_t(p.team_t),
+                        carrier: p.carrier,
+                        name: p.name.clone(),
+                        hp: p.hp,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn spec_candidates(&self) -> Vec<(Vec3, f32, String)> {
+        let mut v = Vec::new();
+        if self.is_authority() {
+            for b in &self.bots {
+                if b.alive && b.team == self.player_team {
+                    v.push((b.eye(), b.yaw, b.name.to_string()));
+                }
+            }
+            for r in &self.remotes {
+                if r.alive && r.team == self.player_team {
+                    v.push((r.eye(), r.render_yaw, r.name.clone()));
+                }
+            }
+        } else if let Some(snap) = &self.cstate.snap {
+            for p in &snap.players {
+                if p.alive && p.id != self.cstate.my_id && Team::from_t(p.team_t) == self.player_team {
+                    v.push((v3(p.pos) + vec3(0.0, EYE, 0.0), p.yaw, p.name.clone()));
+                }
+            }
+            for b in &snap.bots {
+                if b.alive && Team::from_t(b.team_t) == self.player_team {
+                    v.push((v3(b.pos) + vec3(0.0, 1.5, 0.0), b.yaw, b.name.clone()));
+                }
+            }
+        }
+        v
+    }
+
+    fn draw_world(&self, t_now: f64, cam: &Camera3D) {
         for m in &self.meshes {
             draw_mesh(m);
         }
-        for (i, b) in self.bots.iter().enumerate() {
-            if b.alive {
-                self.draw_bot(b, i);
-            }
+        let ents = self.collect_draw_ents();
+        for e in &ents {
+            self.draw_character(e);
         }
-        if let Some(dp) = self.dropped {
+        let dropped_view = if self.is_authority() {
+            self.dropped
+        } else {
+            self.cstate.snap.as_ref().and_then(|s| s.dropped).map(v3)
+        };
+        if let Some(dp) = dropped_view {
             self.draw_obox(
                 dp + vec3(0.0, 0.12, 0.0),
                 0.0,
@@ -1880,16 +2636,16 @@ impl Game {
                 Color::from_rgba(120, 35, 30, 255),
             );
         }
-        if let Some(b) = &self.bomb {
+        if let Some((bp, t, defused)) = self.bomb_view() {
             self.draw_obox(
-                b.pos + vec3(0.0, 0.12, 0.0),
+                bp + vec3(0.0, 0.12, 0.0),
                 0.6,
                 vec3(0.22, 0.12, 0.14),
                 Color::from_rgba(110, 32, 28, 255),
             );
-            let blink = ((t_now * (2.0 + (1.0 - (b.t / BOMB_TIME) as f64) * 10.0)).sin() > 0.0) as i32;
-            if blink == 1 && !self.defused {
-                draw_sphere(b.pos + vec3(0.12, 0.28, 0.0), 0.05, None, RED);
+            let blink = ((t_now * (2.0 + (1.0 - (t / BOMB_TIME) as f64) * 10.0)).sin() > 0.0) as i32;
+            if blink == 1 && !defused {
+                draw_sphere(bp + vec3(0.12, 0.28, 0.0), 0.05, None, RED);
             }
         }
         for (a, b, _) in &self.tracers {
@@ -1904,8 +2660,7 @@ impl Game {
             draw_sphere(p + vec3(0.0, 1.0, 0.0), r, None, Color::new(1.0, 0.6, 0.15, a * 0.8));
             draw_sphere(p + vec3(0.0, 1.0, 0.0), r * 0.6, None, Color::new(1.0, 0.9, 0.5, a));
         }
-        // debug: bot paths + vision lines
-        if self.dbg_paths {
+        if self.dbg_paths && self.is_authority() {
             for b in &self.bots {
                 if !b.alive {
                     continue;
@@ -1923,11 +2678,22 @@ impl Game {
                 }
                 if let Some(t) = b.target {
                     if b.can_see {
-                        draw_line_3d(b.eye(), self.ent_eye(t), Color::new(1.0, 0.1, 0.1, 0.9));
+                        let te = match t {
+                            Ent::Me => self.player_eye(),
+                            Ent::Remote(id) => self
+                                .remotes
+                                .iter()
+                                .find(|r| r.id == id)
+                                .map(|r| r.eye())
+                                .unwrap_or(b.eye()),
+                            Ent::Bot(j) => self.bots.get(j).map(|x| x.eye()).unwrap_or(b.eye()),
+                        };
+                        draw_line_3d(b.eye(), te, Color::new(1.0, 0.1, 0.1, 0.9));
                     }
                 }
             }
         }
+        let _ = cam;
     }
 
     fn draw_viewmodel(&self) {
@@ -1972,7 +2738,34 @@ impl Game {
         ))
     }
 
-    fn draw_hud(&self, cam: &Camera3D) {
+    fn hud_numbers(&self) -> (i32, i32, f32, bool, u8) {
+        if self.is_authority() {
+            let planted = self.bomb.is_some() && !self.defused;
+            let timer = if let Some(b) = &self.bomb {
+                if self.defused {
+                    0.0
+                } else {
+                    b.t
+                }
+            } else {
+                self.round_time
+            };
+            let phase = match self.phase {
+                Phase::Freeze => 0,
+                Phase::Live => 1,
+                _ => 2,
+            };
+            (self.score_ct, self.score_t, timer, planted, phase)
+        } else if let Some(s) = &self.cstate.snap {
+            let planted = s.bomb.map_or(false, |(_, _, d)| !d);
+            let timer = s.bomb.map_or(s.round_time, |(_, t, d)| if d { 0.0 } else { t });
+            (s.score_ct, s.score_t, timer, planted, s.phase)
+        } else {
+            (0, 0, 0.0, false, 0)
+        }
+    }
+
+    fn draw_hud(&mut self, cam: &Camera3D) {
         let sw = screen_width();
         let sh = screen_height();
         let cx = sw / 2.0;
@@ -1984,36 +2777,45 @@ impl Game {
                 draw_text(label, s.x - m.width / 2.0, s.y, 34.0, Color::new(1.0, 0.8, 0.4, 0.75));
             }
         }
-        if let Some(b) = &self.bomb {
-            if !self.defused {
-                if let Some(s) = self.project(cam, b.pos + vec3(0.0, 0.8, 0.0)) {
+        if let Some((bp, _, defused)) = self.bomb_view() {
+            if !defused {
+                if let Some(s) = self.project(cam, bp + vec3(0.0, 0.8, 0.0)) {
                     let m = measure_text("C4", None, 22, 1.0);
                     draw_text("C4", s.x - m.width / 2.0, s.y, 22.0, Color::new(1.0, 0.3, 0.25, 0.9));
                 }
             }
         }
 
-        // ESP wallhack
+        // name tags for human players
+        for e in self.collect_draw_ents() {
+            if e.name.is_empty() {
+                continue;
+            }
+            if let Some(s) = self.project(cam, e.pos + vec3(0.0, 2.05, 0.0)) {
+                let col = if e.team == Team::T {
+                    Color::from_rgba(255, 180, 110, 220)
+                } else {
+                    Color::from_rgba(140, 190, 255, 220)
+                };
+                let m = measure_text(&e.name, None, 16, 1.0);
+                draw_text(&e.name, s.x - m.width / 2.0, s.y, 16.0, col);
+            }
+        }
+
         if self.dbg_esp {
-            for b in &self.bots {
-                if !b.alive {
-                    continue;
-                }
-                let col = if b.team == Team::T {
+            for e in self.collect_draw_ents() {
+                let col = if e.team == Team::T {
                     Color::from_rgba(255, 160, 70, 255)
                 } else {
                     Color::from_rgba(110, 170, 255, 255)
                 };
                 if let (Some(top), Some(bottom)) = (
-                    self.project(cam, b.pos + vec3(0.0, 1.85, 0.0)),
-                    self.project(cam, b.pos),
+                    self.project(cam, e.pos + vec3(0.0, 1.85, 0.0)),
+                    self.project(cam, e.pos),
                 ) {
                     let h = (bottom.y - top.y).abs().max(4.0);
                     let w = h * 0.45;
                     draw_rectangle_lines(top.x - w / 2.0, top.y, w, h, 1.5, col);
-                    let label = format!("{} {}hp", b.name, b.hp);
-                    let m = measure_text(&label, None, 14, 1.0);
-                    draw_text(&label, top.x - m.width / 2.0, top.y - 4.0, 14.0, col);
                 }
             }
         }
@@ -2043,8 +2845,10 @@ impl Game {
             draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.1, 0.0, 0.0, 0.25));
             let m = measure_text("YOU DIED", None, 44, 1.0);
             draw_text("YOU DIED", cx - m.width / 2.0, sh * 0.18, 44.0, Color::new(1.0, 0.25, 0.2, 0.85));
-            if let Some(i) = self.spec {
-                let label = format!("Spectating {}  (LMB / Space: next)", self.bots[i].name);
+            let cands = self.spec_candidates();
+            if !cands.is_empty() {
+                let i = self.current_spec_index();
+                let label = format!("Spectating {}  (LMB / Space: next)", cands[i].2);
                 let m2 = measure_text(&label, None, 20, 1.0);
                 draw_text(&label, cx - m2.width / 2.0, sh - 60.0, 20.0, WHITE);
             }
@@ -2063,27 +2867,19 @@ impl Game {
         draw_text(&ammo_str, sw - m.width - 26.0, sh - 22.0, 40.0, WHITE);
         let m2 = measure_text(wname, None, 18, 1.0);
         draw_text(wname, sw - m2.width - 26.0, sh - 50.0, 18.0, Color::from_rgba(255, 210, 120, 255));
-        if self.carrier == Some(0) {
+        if self.i_am_carrier() {
             draw_text("C4", sw - 70.0, sh - 80.0, 24.0, Color::from_rgba(255, 90, 70, 255));
         }
 
-        let timer = if let Some(b) = &self.bomb {
-            if self.defused {
-                0.0
-            } else {
-                b.t
-            }
-        } else {
-            self.round_time
-        };
+        let (score_ct, score_t, timer, planted, _phase) = self.hud_numbers();
         let mins = (timer.max(0.0) as i32) / 60;
         let secs = (timer.max(0.0) as i32) % 60;
-        let tcol = if self.bomb.is_some() && !self.defused {
+        let tcol = if planted {
             Color::from_rgba(255, 70, 70, 255)
         } else {
             WHITE
         };
-        let bar = format!("CT {}      {}:{:02}      {} T", self.score_ct, mins, secs, self.score_t);
+        let bar = format!("CT {}      {}:{:02}      {} T", score_ct, mins, secs, score_t);
         let m3 = measure_text(&bar, None, 26, 1.0);
         draw_rectangle(cx - m3.width / 2.0 - 14.0, 10.0, m3.width + 28.0, 34.0, Color::new(0.0, 0.0, 0.0, 0.5));
         draw_text(&bar, cx - m3.width / 2.0, 34.0, 26.0, tcol);
@@ -2106,20 +2902,35 @@ impl Game {
             ky += 26.0;
         }
 
-        // E-interaction bars
+        // interaction bar: authority uses local timers, client uses snapshot progress
         let bar_y = sh * 0.68;
-        if self.defuse_t > 0.0 {
-            self.draw_progress(cx, bar_y, "DEFUSING", self.defuse_t / DEFUSE_TIME);
-        } else if self.plant_t > 0.0 {
-            self.draw_progress(cx, bar_y, "PLANTING", self.plant_t / PLANT_TIME);
-        } else if self.palive && self.phase == Phase::Live {
-            if let Some(b) = &self.bomb {
-                if self.player_team == Team::Ct && !self.defused && self.ppos.distance(b.pos) < 2.4 {
+        let (plant_frac, defuse_frac) = if self.is_authority() {
+            (self.plant_t / PLANT_TIME, self.defuse_t / DEFUSE_TIME)
+        } else {
+            let p = self
+                .cstate
+                .snap
+                .as_ref()
+                .and_then(|s| s.players.iter().find(|p| p.id == self.cstate.my_id))
+                .map_or(0.0, |p| p.progress);
+            if self.player_team == Team::T {
+                (p, 0.0)
+            } else {
+                (0.0, p)
+            }
+        };
+        if defuse_frac > 0.0 {
+            self.draw_progress(cx, bar_y, "DEFUSING", defuse_frac);
+        } else if plant_frac > 0.0 {
+            self.draw_progress(cx, bar_y, "PLANTING", plant_frac);
+        } else if self.palive && self.local_phase_live() {
+            if let Some((bp, _, defused)) = self.bomb_view() {
+                if self.player_team == Team::Ct && !defused && self.ppos.distance(bp) < 2.4 {
                     let hint = "Hold E to defuse";
                     let m7 = measure_text(hint, None, 22, 1.0);
                     draw_text(hint, cx - m7.width / 2.0, bar_y, 22.0, WHITE);
                 }
-            } else if self.player_team == Team::T && self.carrier == Some(0) && self.near_any_site() {
+            } else if self.player_team == Team::T && self.i_am_carrier() && self.near_any_site() {
                 let hint = "Hold E to plant the bomb";
                 let m7 = measure_text(hint, None, 22, 1.0);
                 draw_text(hint, cx - m7.width / 2.0, bar_y, 22.0, WHITE);
@@ -2127,8 +2938,29 @@ impl Game {
         }
 
         draw_text(&format!("{} fps", get_fps()), 10.0, 20.0, 16.0, Color::new(1.0, 1.0, 1.0, 0.5));
+        match &self.role {
+            Role::Host(_) => {
+                let n = self.remotes.len();
+                draw_text(
+                    &format!("HOSTING - {} connected (ticket in clipboard)", n),
+                    10.0,
+                    38.0,
+                    14.0,
+                    Color::new(0.6, 1.0, 0.6, 0.7),
+                );
+            }
+            Role::Client(_) => {
+                if let Some(why) = &self.cstate.disconnect {
+                    let m = measure_text("DISCONNECTED", None, 40, 1.0);
+                    draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.0, 0.0, 0.0, 0.6));
+                    draw_text("DISCONNECTED", cx - m.width / 2.0, cy - 20.0, 40.0, RED);
+                    let m2 = measure_text(why, None, 18, 1.0);
+                    draw_text(why, cx - m2.width / 2.0, cy + 10.0, 18.0, WHITE);
+                }
+            }
+            Role::Solo => {}
+        }
 
-        // debug panel
         if self.dbg_open {
             let items = [
                 ("F1 god", self.dbg_god),
@@ -2139,12 +2971,12 @@ impl Game {
                 ("F6 kill enemies", false),
                 ("F7 heal + ammo", false),
             ];
-            draw_rectangle(8.0, 30.0, 170.0, 24.0 + items.len() as f32 * 20.0, Color::new(0.0, 0.0, 0.0, 0.6));
-            draw_text("DEBUG (F10)", 16.0, 48.0, 16.0, YELLOW);
+            draw_rectangle(8.0, 46.0, 170.0, 24.0 + items.len() as f32 * 20.0, Color::new(0.0, 0.0, 0.0, 0.6));
+            draw_text("DEBUG (F10)", 16.0, 64.0, 16.0, YELLOW);
             for (k, (label, on)) in items.iter().enumerate() {
                 let col = if *on { GREEN } else { Color::from_rgba(200, 200, 200, 255) };
                 let state = if *on { " ON" } else { "" };
-                draw_text(&format!("{label}{state}"), 16.0, 68.0 + k as f32 * 20.0, 15.0, col);
+                draw_text(&format!("{label}{state}"), 16.0, 84.0 + k as f32 * 20.0, 15.0, col);
             }
         }
 
@@ -2152,6 +2984,15 @@ impl Game {
             let m8 = measure_text("PAUSED - click to resume", None, 30, 1.0);
             draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.0, 0.0, 0.0, 0.45));
             draw_text("PAUSED - click to resume", cx - m8.width / 2.0, cy, 30.0, WHITE);
+        }
+    }
+
+    fn current_spec_index(&self) -> usize {
+        let n = self.spec_candidates().len();
+        if n == 0 {
+            0
+        } else {
+            self.spec_i % n
         }
     }
 
@@ -2170,10 +3011,24 @@ impl Game {
         draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.03, 0.04, 0.06, 0.82));
         let title = "de_micro";
         let mt = measure_text(title, None, 72, 1.0);
-        draw_text(title, cx - mt.width / 2.0, sh * 0.26, 72.0, Color::from_rgba(255, 210, 120, 255));
-        let sub = "Defuse mode vs bots - first to 8 rounds";
-        let ms = measure_text(sub, None, 24, 1.0);
-        draw_text(sub, cx - ms.width / 2.0, sh * 0.26 + 36.0, 24.0, Color::from_rgba(180, 180, 180, 255));
+        draw_text(title, cx - mt.width / 2.0, sh * 0.22, 72.0, Color::from_rgba(255, 210, 120, 255));
+        let sub = match &self.role {
+            Role::Solo => "Defuse mode vs bots - first to 8 rounds".to_string(),
+            Role::Host(_) => match &self.ticket {
+                Some(_) => "HOSTING - ticket copied to clipboard, send it to friends".to_string(),
+                None => "HOSTING - getting ticket...".to_string(),
+            },
+            Role::Client(_) => "JOINING - pick a team, then click".to_string(),
+        };
+        let ms = measure_text(&sub, None, 24, 1.0);
+        draw_text(&sub, cx - ms.width / 2.0, sh * 0.22 + 36.0, 24.0, Color::from_rgba(180, 220, 180, 255));
+
+        if let Some(t) = &self.ticket {
+            let short = format!("{}...{}", &t[..16.min(t.len())], &t[t.len().saturating_sub(8)..]);
+            let line = format!("ticket: {short}");
+            let m = measure_text(&line, None, 16, 1.0);
+            draw_text(&line, cx - m.width / 2.0, sh * 0.22 + 62.0, 16.0, GRAY);
+        }
 
         let ct_sel = self.player_team == Team::Ct;
         let ct_label = if ct_sel { "> [1] Counter-Terrorists <" } else { "[1] Counter-Terrorists" };
@@ -2182,7 +3037,7 @@ impl Game {
         draw_text(
             ct_label,
             cx - mc.width / 2.0,
-            sh * 0.42,
+            sh * 0.4,
             28.0,
             if ct_sel { Color::from_rgba(110, 170, 255, 255) } else { GRAY },
         );
@@ -2190,26 +3045,84 @@ impl Game {
         draw_text(
             t_label,
             cx - mt2.width / 2.0,
-            sh * 0.42 + 34.0,
+            sh * 0.4 + 34.0,
             28.0,
             if !ct_sel { Color::from_rgba(255, 160, 70, 255) } else { GRAY },
         );
 
+        if self.is_authority() {
+            let ff_label = format!("[F] friendly fire: {}", if self.ff { "ON" } else { "OFF" });
+            let bots_label = format!("[Up/Down] bots fill teams to: {}", self.bot_fill);
+            let mf = measure_text(&ff_label, None, 22, 1.0);
+            draw_text(
+                &ff_label,
+                cx - mf.width / 2.0,
+                sh * 0.4 + 78.0,
+                22.0,
+                if self.ff { Color::from_rgba(255, 120, 120, 255) } else { GRAY },
+            );
+            let mb = measure_text(&bots_label, None, 22, 1.0);
+            draw_text(&bots_label, cx - mb.width / 2.0, sh * 0.4 + 106.0, 22.0, Color::from_rgba(210, 210, 210, 255));
+        }
+
         let lines = [
             "WASD move    Mouse aim / shoot    Space jump    Shift walk",
             "1 AK-47    2 pistol    R reload    E plant / defuse    Esc pause",
-            "F10 debug menu    LMB / Space cycle spectate when dead",
+            "F10 debug    --host to host online    --join <ticket> to join",
         ];
-        let mut y = sh * 0.58;
+        let mut y = sh * 0.62;
         for l in lines {
             let m = measure_text(l, None, 20, 1.0);
             draw_text(l, cx - m.width / 2.0, y, 20.0, Color::from_rgba(210, 210, 210, 255));
             y += 30.0;
         }
-        let go = "CLICK TO PLAY";
+        let go = if matches!(self.role, Role::Client(_)) && !self.cstate.welcomed {
+            "CLICK TO CONNECT"
+        } else {
+            "CLICK TO PLAY"
+        };
         let mg = measure_text(go, None, 30, 1.0);
         let pulse = ((get_time() * 3.0).sin() * 0.3 + 0.7) as f32;
-        draw_text(go, cx - mg.width / 2.0, sh * 0.76, 30.0, Color::new(0.3, 1.0, 0.3, pulse));
+        draw_text(go, cx - mg.width / 2.0, sh * 0.78, 30.0, Color::new(0.3, 1.0, 0.3, pulse));
+    }
+
+    fn debug_input(&mut self) {
+        if is_key_pressed(KeyCode::F10) {
+            self.dbg_open = !self.dbg_open;
+        }
+        if !self.dbg_open {
+            return;
+        }
+        if is_key_pressed(KeyCode::F1) {
+            self.dbg_god = !self.dbg_god;
+        }
+        if is_key_pressed(KeyCode::F2) {
+            self.dbg_noclip = !self.dbg_noclip;
+        }
+        if is_key_pressed(KeyCode::F3) {
+            self.dbg_esp = !self.dbg_esp;
+        }
+        if is_key_pressed(KeyCode::F4) {
+            self.dbg_paths = !self.dbg_paths;
+        }
+        if is_key_pressed(KeyCode::F5) {
+            self.dbg_freeze = !self.dbg_freeze;
+        }
+        if is_key_pressed(KeyCode::F6) && self.is_authority() {
+            let enemy = if self.player_team == Team::Ct { Team::T } else { Team::Ct };
+            for i in 0..self.bots.len() {
+                if self.bots[i].alive && self.bots[i].team == enemy {
+                    self.kill_bot(i, "Debug".to_string(), self.player_team);
+                }
+            }
+        }
+        if is_key_pressed(KeyCode::F7) {
+            self.php = 100;
+            for i in 0..2 {
+                self.wpn[i].mag = WPNS[i].mag_size;
+                self.wpn[i].reserve = WPNS[i].reserve_start;
+            }
+        }
     }
 }
 
@@ -2231,16 +3144,75 @@ fn conf() -> Conf {
 #[macroquad::main(conf)]
 async fn main() {
     rand::srand(macroquad::miniquad::date::now() as u64);
+
+    let args: Vec<String> = std::env::args().collect();
+    let mut role_arg = 0; // 0 solo, 1 host
+    let mut join_ticket: Option<String> = None;
+    let mut name = std::env::var("USER").unwrap_or_else(|_| "Player".into());
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => role_arg = 1,
+            "--join" => {
+                if i + 1 < args.len() {
+                    join_ticket = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--name" => {
+                if i + 1 < args.len() {
+                    name = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
     let snd = Sounds::load().await;
     let (walls, meshes) = build_map();
     let nav = Nav::build(&walls);
+
+    let client_wants_t = args.iter().any(|a| a == "--team-t" || a == "-t");
+    let role = if let Some(t) = &join_ticket {
+        Role::Client(net::start_client(t.clone(), name.clone(), client_wants_t))
+    } else if role_arg == 1 {
+        Role::Host(net::start_host())
+    } else {
+        Role::Solo
+    };
 
     let mut g = Game {
         walls,
         meshes,
         nav,
         snd,
-        player_team: Team::Ct,
+        role,
+        my_name: name,
+        ff: false,
+        bot_fill: 4,
+        ticket: None,
+        cstate: CState {
+            my_id: 255,
+            welcomed: false,
+            snap: None,
+            step_acc: Default::default(),
+            spawn_seq: 0,
+            beep_t: 0.0,
+            prev_hp: 100,
+            prev_alive: true,
+            disconnect: None,
+        },
+        remotes: Vec::new(),
+        ev_buf: Vec::new(),
+        snap_timer: 0.0,
+        input_timer: 0.0,
+        player_team: if std::env::args().any(|a| a == "--team-t" || a == "-t") {
+            Team::T
+        } else {
+            Team::Ct
+        },
         ppos: vec3(0.0, 0.0, 26.0),
         pvel: Vec3::ZERO,
         yaw: 0.0,
@@ -2262,7 +3234,7 @@ async fn main() {
         defuse_t: 0.0,
         plant_t: 0.0,
         step_t: 0.0,
-        spec: None,
+        spec_i: 0,
         bots: Vec::new(),
         bomb: None,
         defused: false,
@@ -2309,19 +3281,33 @@ async fn main() {
             println!("{} fps", get_fps());
         }
 
+        // network polling always runs (even paused / in menu)
+        g.host_poll(dt);
+        g.client_poll();
+
         if is_key_pressed(KeyCode::Escape) && g.grabbed {
             g.grabbed = false;
             set_cursor_grab(false);
             show_mouse(true);
         }
 
-        // menu team select
         if g.phase == Phase::Menu {
             if is_key_pressed(KeyCode::Key1) {
                 g.player_team = Team::Ct;
             }
             if is_key_pressed(KeyCode::Key2) {
                 g.player_team = Team::T;
+            }
+            if g.is_authority() {
+                if is_key_pressed(KeyCode::F) {
+                    g.ff = !g.ff;
+                }
+                if is_key_pressed(KeyCode::Up) {
+                    g.bot_fill = (g.bot_fill + 1).min(4);
+                }
+                if is_key_pressed(KeyCode::Down) {
+                    g.bot_fill = (g.bot_fill - 1).max(0);
+                }
             }
         }
 
@@ -2330,14 +3316,15 @@ async fn main() {
             set_cursor_grab(true);
             show_mouse(false);
             g.last_mouse = mouse_position().into();
-            if g.phase == Phase::Menu {
-                g.setup_teams();
+            if g.phase == Phase::Menu && g.is_authority() {
                 g.start_round();
+            } else if g.phase == Phase::Menu {
+                // client: leave menu; gameplay state driven by snapshots
+                g.phase = Phase::Live;
             }
         } else if g.grabbed && !g.palive && g.phase != Phase::Menu {
-            // spectate cycling
             if is_mouse_button_pressed(MouseButton::Left) || is_key_pressed(KeyCode::Space) {
-                g.spec = g.next_spec(g.spec);
+                g.spec_i = g.spec_i.wrapping_add(1);
             }
         }
 
@@ -2351,45 +3338,58 @@ async fn main() {
 
         g.debug_input();
 
-        let paused = !g.grabbed && g.phase != Phase::Menu;
+        let paused = !g.grabbed && g.phase != Phase::Menu && matches!(g.role, Role::Solo);
 
         if !paused && g.phase != Phase::Menu {
-            match g.phase {
-                Phase::Freeze => {
-                    g.phase_t -= dt;
-                    if g.phase_t <= 0.0 {
-                        g.phase = Phase::Live;
-                        g.show_msg("GO!", 1.0);
-                        play(&g.snd.beep, 0.4);
+            if g.is_authority() {
+                match g.phase {
+                    Phase::Freeze => {
+                        g.phase_t -= dt;
+                        g.remotes_update(dt);
+                        if g.phase_t <= 0.0 {
+                            g.phase = Phase::Live;
+                            g.show_msg("GO!", 1.0);
+                            play(&g.snd.beep, 0.4);
+                        }
                     }
+                    Phase::Live => {
+                        if g.bomb.is_none() {
+                            g.round_time -= dt;
+                        }
+                        g.player_update(dt);
+                        g.remotes_update(dt);
+                        if !g.dbg_freeze {
+                            g.bots_update(dt);
+                        }
+                        g.bomb_update(dt);
+                        g.check_round_end();
+                    }
+                    Phase::Post => {
+                        g.phase_t -= dt;
+                        g.player_update(dt);
+                        g.remotes_update(dt);
+                        g.bomb_update(dt);
+                        if g.phase_t <= 0.0 {
+                            g.start_round();
+                        }
+                    }
+                    Phase::Menu => {}
                 }
-                Phase::Live => {
-                    if g.bomb.is_none() {
-                        g.round_time -= dt;
-                    }
+                g.host_broadcast(dt);
+            } else {
+                // client: local movement + send inputs; world state from snapshots
+                if g.cstate.disconnect.is_none() {
                     g.player_update(dt);
-                    if !g.dbg_freeze {
-                        g.bots_update(dt);
-                    }
-                    g.bomb_update(dt);
-                    g.check_round_end();
-                }
-                Phase::Post => {
-                    g.phase_t -= dt;
-                    g.player_update(dt);
-                    g.bomb_update(dt);
-                    if g.phase_t <= 0.0 {
-                        g.start_round();
-                    }
-                }
-                Phase::Menu => {}
-            }
-
-            // dead spectator auto-advance if target died
-            if !g.palive {
-                if let Some(i) = g.spec {
-                    if !g.bots[i].alive {
-                        g.spec = g.next_spec(Some(i));
+                    g.client_send_input(dt);
+                    // bomb beeps from snapshot
+                    if let Some((bp, t, defused)) = g.bomb_view() {
+                        if !defused {
+                            g.cstate.beep_t -= dt;
+                            if g.cstate.beep_t <= 0.0 {
+                                g.cstate.beep_t = 0.12 + (t / BOMB_TIME).max(0.0) * 0.95;
+                                play(&g.snd.beep, dist_vol(g.ppos, bp, 0.6).max(0.12));
+                            }
+                        }
                     }
                 }
             }
@@ -2418,19 +3418,26 @@ async fn main() {
                 k.2 -= dt;
             }
             g.killfeed.retain(|k| k.2 > 0.0);
+        } else if g.phase == Phase::Menu && matches!(g.role, Role::Host(_)) {
+            // host can sit in menu while clients wait; keep broadcasting empty-ish snaps
+            g.host_broadcast(dt);
         }
 
-        // camera: player, or spectated bot when dead
         clear_background(Color::from_rgba(136, 174, 224, 255));
         let shake_off = if g.shake > 0.0 {
             vec3(gen_range(-g.shake, g.shake), gen_range(-g.shake, g.shake), 0.0)
         } else {
             Vec3::ZERO
         };
-        let (eye, dir) = if !g.palive && g.spec.is_some() && g.phase != Phase::Menu {
-            let b = &g.bots[g.spec.unwrap()];
-            let d = vec3(-b.yaw.sin(), 0.0, -b.yaw.cos());
-            (b.eye() + shake_off, d)
+        let (eye, dir) = if !g.palive && g.phase != Phase::Menu {
+            let cands = g.spec_candidates();
+            if cands.is_empty() {
+                (g.player_eye() + shake_off, g.look_dir())
+            } else {
+                let i = g.current_spec_index();
+                let (e, yaw, _) = &cands[i];
+                (*e + shake_off, vec3(-yaw.sin(), 0.0, -yaw.cos()))
+            }
         } else {
             (g.player_eye() + shake_off, g.look_dir())
         };
@@ -2442,7 +3449,7 @@ async fn main() {
             ..Default::default()
         };
         set_camera(&cam);
-        g.draw_world(t_now);
+        g.draw_world(t_now, &cam);
         g.draw_viewmodel();
         set_default_camera();
         if g.phase == Phase::Menu {
