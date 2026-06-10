@@ -926,6 +926,7 @@ struct Game {
     dbg_esp: bool,
     dbg_paths: bool,
     dbg_freeze: bool,
+    dbg_uncap: bool,
 
     grabbed: bool,
     last_mouse: Vec2,
@@ -2621,6 +2622,10 @@ impl Game {
         }
         let ents = self.collect_draw_ents();
         for e in &ents {
+            // skip whoever the camera is inside (spectated player/bot)
+            if (e.pos + vec3(0.0, 1.5, 0.0)).distance(cam.position) < 0.8 {
+                continue;
+            }
             self.draw_character(e);
         }
         let dropped_view = if self.is_authority() {
@@ -2788,7 +2793,7 @@ impl Game {
 
         // name tags for human players
         for e in self.collect_draw_ents() {
-            if e.name.is_empty() {
+            if e.name.is_empty() || (e.pos + vec3(0.0, 1.5, 0.0)).distance(cam.position) < 0.8 {
                 continue;
             }
             if let Some(s) = self.project(cam, e.pos + vec3(0.0, 2.05, 0.0)) {
@@ -2970,6 +2975,7 @@ impl Game {
                 ("F5 freeze AI", self.dbg_freeze),
                 ("F6 kill enemies", false),
                 ("F7 heal + ammo", false),
+                ("F8 uncap fps", self.dbg_uncap),
             ];
             draw_rectangle(8.0, 46.0, 170.0, 24.0 + items.len() as f32 * 20.0, Color::new(0.0, 0.0, 0.0, 0.6));
             draw_text("DEBUG (F10)", 16.0, 64.0, 16.0, YELLOW);
@@ -3123,6 +3129,9 @@ impl Game {
                 self.wpn[i].reserve = WPNS[i].reserve_start;
             }
         }
+        if is_key_pressed(KeyCode::F8) {
+            self.dbg_uncap = !self.dbg_uncap;
+        }
     }
 }
 
@@ -3265,11 +3274,13 @@ async fn main() {
         dbg_esp: false,
         dbg_paths: false,
         dbg_freeze: false,
+        dbg_uncap: false,
         grabbed: false,
         last_mouse: mouse_position().into(),
     };
 
     let mut fps_log = 0u32;
+    let mut next_deadline = std::time::Instant::now();
 
     loop {
         macroquad::miniquad::window::schedule_update();
@@ -3456,6 +3467,18 @@ async fn main() {
             g.draw_menu();
         } else {
             g.draw_hud(&cam);
+        }
+
+        if !g.dbg_uncap {
+            next_deadline += std::time::Duration::from_micros(16_666);
+            let now = std::time::Instant::now();
+            if now < next_deadline {
+                std::thread::sleep(next_deadline - now);
+            } else {
+                next_deadline = now;
+            }
+        } else {
+            next_deadline = std::time::Instant::now();
         }
 
         next_frame().await;
