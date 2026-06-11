@@ -7,6 +7,14 @@ use tokio::sync::mpsc as tmpsc;
 
 pub const ALPN: &[u8] = b"de-micro/1";
 const MAX_FRAME: u32 = 1 << 20;
+// Cap the length of a client-supplied player name. Names are rendered in the
+// scoreboard / kill feed, so an unbounded name (up to MAX_FRAME) would be a
+// grief / resource-abuse vector.
+const MAX_NAME: usize = 24;
+// Inbound message rate limit per connection. Legitimate clients send inputs at
+// ~30 Hz plus a handful of shots, so ~40 msg/s; this leaves generous headroom
+// while still cutting off a client that floods the host to exhaust CPU/memory.
+const MAX_MSGS_PER_SEC: u32 = 200;
 
 // ---------- wire types ----------
 
@@ -222,7 +230,15 @@ pub fn start_host() -> HostNet {
                     // first frame must be Hello
                     let hello = match read_frame(&mut recv).await {
                         Some(buf) => match postcard::from_bytes::<C2S>(&buf) {
-                            Ok(C2S::Hello { name, want_t }) => (name, want_t),
+                            Ok(C2S::Hello { mut name, want_t }) => {
+                                // Bound the client-supplied name (by chars, so we
+                                // never split a UTF-8 sequence) before it is stored
+                                // and broadcast to every other player.
+                                if name.chars().count() > MAX_NAME {
+                                    name = name.chars().take(MAX_NAME).collect();
+                                }
+                                (name, want_t)
+                            }
                             _ => return,
                         },
                         None => return,
@@ -243,7 +259,21 @@ pub fn start_host() -> HostNet {
                         }
                     });
 
+                    let mut window_start = std::time::Instant::now();
+                    let mut msgs_in_window: u32 = 0;
                     while let Some(buf) = read_frame(&mut recv).await {
+                        // Per-connection inbound rate limit: a client that
+                        // exceeds the budget within a 1s window is dropped to
+                        // protect the host from message floods.
+                        let now = std::time::Instant::now();
+                        if now.duration_since(window_start).as_secs_f32() >= 1.0 {
+                            window_start = now;
+                            msgs_in_window = 0;
+                        }
+                        msgs_in_window += 1;
+                        if msgs_in_window > MAX_MSGS_PER_SEC {
+                            break;
+                        }
                         if let Ok(msg) = postcard::from_bytes::<C2S>(&buf) {
                             if ev_tx.send(HostEvent::Msg { id, msg }).is_err() {
                                 break;

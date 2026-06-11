@@ -23,6 +23,13 @@ const BOT_DEFUSE_TIME: f32 = 8.0;
 const FREEZE_TIME: f32 = 2.5;
 const WIN_SCORE: i32 = 8;
 const NET_RATE: f32 = 1.0 / 30.0;
+// Anti-cheat: a client's claimed shot origin must be plausibly close to where
+// the host last saw that player. This rejects "teleport-aim" claims (firing
+// from an arbitrary point on the map) while staying generous enough to absorb
+// normal movement/latency between input ticks. It does not turn the host fully
+// authoritative (hit detection is still client-reported, as documented), but it
+// removes the most trivial spoofing.
+const SHOT_ORIGIN_TOLERANCE: f32 = 4.0;
 
 const BOT_NAMES: [&str; 10] = [
     "Phoenix", "Viper", "Sandman", "Crusher", "Steel", "Hawk", "Reaper", "Falcon", "Brute", "Ghost",
@@ -173,6 +180,14 @@ fn v3(a: [f32; 3]) -> Vec3 {
 
 fn a3(v: Vec3) -> [f32; 3] {
     [v.x, v.y, v.z]
+}
+
+// True only if every component of a network-supplied vector is finite (no NaN
+// or +/-Inf). Malicious/buggy clients can send non-finite floats which slip
+// past `f32::clamp` (comparisons against NaN are false) and would otherwise
+// corrupt simulation and rendering for the whole lobby.
+fn finite3(a: [f32; 3]) -> bool {
+    a[0].is_finite() && a[1].is_finite() && a[2].is_finite()
 }
 
 // ---------- audio synth ----------
@@ -2106,8 +2121,18 @@ impl Game {
                     }
                     HostEvent::Joined { id, name, want_t } => joined.push((id, name, want_t)),
                     HostEvent::Msg { id, msg } => match msg {
-                        C2S::Input(inp) => inputs.push((id, inp)),
-                        C2S::Shot(s) => shots.push((id, s)),
+                        // Drop inputs/shots carrying non-finite coordinates or
+                        // angles before they reach the simulation.
+                        C2S::Input(inp) => {
+                            if finite3(inp.pos) && inp.yaw.is_finite() && inp.pitch.is_finite() {
+                                inputs.push((id, inp));
+                            }
+                        }
+                        C2S::Shot(s) => {
+                            if finite3(s.from) && finite3(s.to) {
+                                shots.push((id, s));
+                            }
+                        }
                         C2S::Hello { .. } => {}
                     },
                     HostEvent::Left { id } => left.push(id),
@@ -2183,6 +2208,11 @@ impl Game {
             let shooter_team = r.team;
             let from = v3(s.from);
             let to = v3(s.to);
+            // Reject shots whose claimed origin is implausibly far from the
+            // shooter's last known eye position (teleport-aim spoofing).
+            if from.distance(r.eye()) > SHOT_ORIGIN_TOLERANCE {
+                continue;
+            }
             self.tracers.push((from, to, 0.05));
             self.ev_buf.push(Event::Tracer { from: s.from, to: s.to });
             let vol = dist_vol(self.player_eye(), from, 0.8);
