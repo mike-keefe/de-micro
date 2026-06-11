@@ -33,6 +33,7 @@ Friends and bots share teams; bots top up each team to the configured fill. Host
 ## How to play
 
 - Menu: 1/2 picks team, F toggles friendly fire, Up/Down sets bot fill (0-4 per team), click to start.
+- Online from the menu: **H** hosts (the join ticket is copied to your clipboard - press **C** to copy it again - and printed in the terminal); **V** opens a box where you can paste (Ctrl/Cmd+V) or type a friend's ticket, then Enter to join.
 - Ts plant the C4 at site A or B (hold E in a site); CTs kill them or defuse (hold E at the bomb).
 - First team to 8 rounds. Dead? LMB/Space cycles spectate.
 
