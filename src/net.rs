@@ -230,13 +230,13 @@ pub fn start_host() -> HostNet {
                     // first frame must be Hello
                     let hello = match read_frame(&mut recv).await {
                         Some(buf) => match postcard::from_bytes::<C2S>(&buf) {
-                            Ok(C2S::Hello { mut name, want_t }) => {
-                                // Bound the client-supplied name (by chars, so we
-                                // never split a UTF-8 sequence) before it is stored
-                                // and broadcast to every other player.
-                                if name.chars().count() > MAX_NAME {
-                                    name = name.chars().take(MAX_NAME).collect();
-                                }
+                            Ok(C2S::Hello { name, want_t }) => {
+                                // Bound the client-supplied name before it is
+                                // stored and broadcast to every other player.
+                                // Taking by chars (a) never splits a UTF-8
+                                // sequence and (b) stops after MAX_NAME, so we
+                                // never iterate a maliciously huge name.
+                                let name: String = name.chars().take(MAX_NAME).collect();
                                 (name, want_t)
                             }
                             _ => return,

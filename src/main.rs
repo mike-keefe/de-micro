@@ -882,6 +882,9 @@ struct Game {
     ff: bool,
     bot_fill: i32,
     ticket: Option<String>,
+    // When `Some`, the menu is in "enter join ticket" text-entry mode; the
+    // string holds what the user has typed/pasted so far.
+    join_input: Option<String>,
     cstate: CState,
     remotes: Vec<RPlayer>,
     ev_buf: Vec<Event>,
@@ -3051,7 +3054,7 @@ impl Game {
         let sub = match &self.role {
             Role::Solo => "Defuse mode vs bots - first to 8 rounds".to_string(),
             Role::Host(_) => match &self.ticket {
-                Some(_) => "HOSTING - ticket copied to clipboard, send it to friends".to_string(),
+                Some(_) => "HOSTING - join ticket copied to clipboard (press C to copy again)".to_string(),
                 None => "HOSTING - getting ticket...".to_string(),
             },
             Role::Client(_) => "JOINING - pick a team, then click".to_string(),
@@ -3059,11 +3062,26 @@ impl Game {
         let ms = measure_text(&sub, None, 24, 1.0);
         draw_text(&sub, cx - ms.width / 2.0, sh * 0.22 + 36.0, 24.0, Color::from_rgba(180, 220, 180, 255));
 
-        if let Some(t) = &self.ticket {
+        if let (Role::Host(_), Some(t)) = (&self.role, &self.ticket) {
             let short = format!("{}...{}", &t[..16.min(t.len())], &t[t.len().saturating_sub(8)..]);
-            let line = format!("ticket: {short}");
+            let line = format!("ticket: {short}  (also printed in the terminal)");
             let m = measure_text(&line, None, 16, 1.0);
             draw_text(&line, cx - m.width / 2.0, sh * 0.22 + 62.0, 16.0, GRAY);
+        }
+
+        // In-game join ticket entry box.
+        if let Some(buf) = &self.join_input {
+            let by = sh * 0.3;
+            let bw = (sw * 0.7).min(760.0);
+            let prompt = "Paste join ticket (Ctrl/Cmd+V) or type it, then Enter - Esc to cancel";
+            let mp = measure_text(prompt, None, 20, 1.0);
+            draw_text(prompt, cx - mp.width / 2.0, by - 14.0, 20.0, Color::from_rgba(255, 220, 150, 255));
+            draw_rectangle(cx - bw / 2.0, by, bw, 34.0, Color::new(0.0, 0.0, 0.0, 0.7));
+            draw_rectangle_lines(cx - bw / 2.0, by, bw, 34.0, 2.0, Color::from_rgba(255, 220, 150, 200));
+            // show the tail of the ticket so the latest typed chars stay visible
+            let shown = if buf.len() > 60 { &buf[buf.len() - 60..] } else { buf.as_str() };
+            let cursor = if (get_time() * 2.0) as i64 % 2 == 0 { "_" } else { " " };
+            draw_text(&format!("{shown}{cursor}"), cx - bw / 2.0 + 10.0, by + 23.0, 20.0, WHITE);
         }
 
         let ct_sel = self.player_team == Team::Ct;
@@ -3102,7 +3120,7 @@ impl Game {
         }
 
         let online_line = if matches!(self.role, Role::Solo) {
-            "[H] host online game    [V] join game (paste ticket into clipboard first)"
+            "[H] host online game    [V] join online game (paste or type a ticket)"
         } else {
             "F10 debug menu in-game"
         };
@@ -3241,6 +3259,7 @@ async fn main() {
         ff: false,
         bot_fill: 4,
         ticket: None,
+        join_input: None,
         cstate: CState {
             my_id: 255,
             welcomed: false,
@@ -3342,45 +3361,97 @@ async fn main() {
         }
 
         if g.phase == Phase::Menu {
-            if is_key_pressed(KeyCode::Key1) {
-                g.player_team = Team::Ct;
-            }
-            if is_key_pressed(KeyCode::Key2) {
-                g.player_team = Team::T;
-            }
-            if g.is_authority() {
-                if is_key_pressed(KeyCode::F) {
-                    g.ff = !g.ff;
-                }
-                if is_key_pressed(KeyCode::Up) {
-                    g.bot_fill = (g.bot_fill + 1).min(4);
-                }
-                if is_key_pressed(KeyCode::Down) {
-                    g.bot_fill = (g.bot_fill - 1).max(0);
-                }
-            }
-            if matches!(g.role, Role::Solo) {
-                if is_key_pressed(KeyCode::H) {
-                    g.role = Role::Host(net::start_host());
-                }
-                if is_key_pressed(KeyCode::V) {
-                    match macroquad::miniquad::window::clipboard_get() {
-                        Some(t) if net::addr_from_ticket(&t).is_some() => {
-                            g.role = Role::Client(net::start_client(
-                                t,
-                                g.my_name.clone(),
-                                g.player_team.is_t(),
-                            ));
+            if let Some(mut buf) = g.join_input.take() {
+                // ----- "enter join ticket" text-entry mode -----
+                let ctrl = is_key_down(KeyCode::LeftControl)
+                    || is_key_down(KeyCode::RightControl)
+                    || is_key_down(KeyCode::LeftSuper)
+                    || is_key_down(KeyCode::RightSuper);
+                if is_key_pressed(KeyCode::Escape) {
+                    // cancel back to the normal menu
+                    while get_char_pressed().is_some() {}
+                } else if ctrl && is_key_pressed(KeyCode::V) {
+                    // paste from the OS clipboard
+                    if let Some(c) = macroquad::miniquad::window::clipboard_get() {
+                        buf.push_str(c.trim());
+                    }
+                    while get_char_pressed().is_some() {}
+                    g.join_input = Some(buf);
+                } else if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
+                    let t = buf.trim().to_string();
+                    if net::addr_from_ticket(&t).is_some() {
+                        g.role = Role::Client(net::start_client(
+                            t,
+                            g.my_name.clone(),
+                            g.player_team.is_t(),
+                        ));
+                    } else {
+                        g.show_sub("that ticket is not valid - check it and try again", 3.0);
+                        g.join_input = Some(buf);
+                    }
+                } else {
+                    if is_key_pressed(KeyCode::Backspace) {
+                        buf.pop();
+                    }
+                    while let Some(c) = get_char_pressed() {
+                        // ignore control chars / the Enter newline; tickets are
+                        // base32 (a-z, 2-7) but accept anything printable so a
+                        // user can paste freely, validation happens on Enter.
+                        if !c.is_control() {
+                            buf.push(c);
                         }
-                        _ => {
-                            g.show_sub("clipboard does not contain a valid ticket", 3.0);
+                    }
+                    g.join_input = Some(buf);
+                }
+            } else {
+                // ----- normal menu -----
+                if is_key_pressed(KeyCode::Key1) {
+                    g.player_team = Team::Ct;
+                }
+                if is_key_pressed(KeyCode::Key2) {
+                    g.player_team = Team::T;
+                }
+                if g.is_authority() {
+                    if is_key_pressed(KeyCode::F) {
+                        g.ff = !g.ff;
+                    }
+                    if is_key_pressed(KeyCode::Up) {
+                        g.bot_fill = (g.bot_fill + 1).min(4);
+                    }
+                    if is_key_pressed(KeyCode::Down) {
+                        g.bot_fill = (g.bot_fill - 1).max(0);
+                    }
+                }
+                if let Role::Host(_) = g.role {
+                    // re-copy the join ticket to the clipboard on demand, in case
+                    // the automatic copy did not take.
+                    if is_key_pressed(KeyCode::C) {
+                        if let Some(t) = g.ticket.clone() {
+                            macroquad::miniquad::window::clipboard_set(&t);
+                            g.show_sub("join ticket copied to clipboard", 2.0);
                         }
+                    }
+                }
+                if matches!(g.role, Role::Solo) {
+                    if is_key_pressed(KeyCode::H) {
+                        g.role = Role::Host(net::start_host());
+                    }
+                    if is_key_pressed(KeyCode::V) {
+                        // open the in-game ticket entry box, pre-filling from the
+                        // clipboard if it already holds a valid ticket.
+                        let prefill = match macroquad::miniquad::window::clipboard_get() {
+                            Some(c) if net::addr_from_ticket(&c).is_some() => c.trim().to_string(),
+                            _ => String::new(),
+                        };
+                        // drop the 'v' keypress so it is not typed into the box
+                        while get_char_pressed().is_some() {}
+                        g.join_input = Some(prefill);
                     }
                 }
             }
         }
 
-        if is_mouse_button_pressed(MouseButton::Left) && !g.grabbed {
+        if is_mouse_button_pressed(MouseButton::Left) && !g.grabbed && g.join_input.is_none() {
             g.grabbed = true;
             set_cursor_grab(true);
             show_mouse(false);
